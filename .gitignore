@@ -1,0 +1,8 @@
+DIRECTOR/
+_work/
+AGENTS.local.md
+.agents/hooks.local.json
+__pycache__/
+*.pyc
+.pytest_cache/
+*.bak-*

@@ -1,0 +1,16 @@
+{
+  "agydw-plugin-seatbelt": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|read_file|view_file|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|grep_search|find_by_name|list_dir|send_message|post_message",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -B -I -X utf8 ../../tools/agy_guard.py --rules ../../tools/guard_rules.json --profile worker --mode remind",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

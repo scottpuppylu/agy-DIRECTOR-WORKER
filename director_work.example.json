@@ -1,0 +1,49 @@
+{
+  "_comment": "Copy to DIRECTOR/director_work.json. schema_version: tools refuse unknown versions. mode: general or beginner. agydw: guard_mode (remind|ask|block), enforce_resume (Stop hook guard). safety: Standard/Strict gates (tests_first, plan_gate, spec_review_for_standard, stop_after_rounds, prefer_auto; docs/13). order_limits: max_files_per_order / max_lines_per_order / max_test_lines_per_order (0 = off). protected_tests: test globs workers may only append to.",
+  "schema_version": 1,
+  "mode": "general",
+  "agydw": {
+    "guard_mode": "remind",
+    "enforce_resume": false,
+    "overwrite_utf8": false
+  },
+  "protect_director": null,
+  "director_worktree": null,
+  "safety": {
+    "spec_review_for_standard": true,
+    "tests_first": true,
+    "plan_gate": true,
+    "stop_after_rounds": 1,
+    "prefer_auto": true
+  },
+  "order_limits": {
+    "max_files_per_order": 3,
+    "max_lines_per_order": 200,
+    "max_test_lines_per_order": 400
+  },
+  "protected_tests": [],
+  "trace_id_pattern": "^(B|DD|OD)-\\d+$",
+  "po_pending_files": ["PO_PENDING.md"],
+  "po_item_pattern": "^\\s*ID\\s*:\\s*(OD|ACT)-\\w+",
+  "po_open_pattern": "^\\s*STATUS\\s*:\\s*open\\b",
+  "resume": {
+    "max_bytes": 20480,
+    "max_line_bytes": 4096,
+    "keep_recent": 10,
+    "protect_headings": ["現況", "未結", "OPEN", "BLOCKED", "TODO", "待辦", "IN_FLIGHT", "DO_NOT_REPEAT"]
+  },
+  "verdict_self_check": "warn",
+  "base_ref": {
+    "check": true,
+    "fetch": true,
+    "strict": false
+  },
+  "release": {
+    "remote": "origin",
+    "branch": "main",
+    "title": "v{version} — agy-DIRECTOR-WORKER",
+    "tag_message": "v{version}",
+    "selftest": "python -I -X utf8 tools/selftest_agy.py",
+    "gh_repo": null
+  }
+}
