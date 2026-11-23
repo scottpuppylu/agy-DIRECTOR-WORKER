@@ -3,6 +3,32 @@
 本 repo 是 [DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK) `v2.6.0`（commit `787f67b`）在 Google Antigravity（App 2.0 / `agy` CLI / IDE / Python SDK）的原生移植版（簡稱 `agydw`），並承襲同作者 `dsh-DIRECTOR-WORKER`（`v2.6.0-ds.6`）的雙軌上游同步架構與安全閘門。
 上游完整變更歷史保留在 [`CHANGELOG-upstream.md`](CHANGELOG-upstream.md)；本檔只記 `agy-DIRECTOR-WORKER` 自己的版本與「對齊初衷」。
 
+## 2.6.0-agy.4（2026-11-24）
+
+### 稽核真實性與多檔案清單（P1 / P2）
+- **`tools/agy_audit.py`（重建 v2.6.0-agy.4）**：
+  - 修正省略 `status` 欄位時預設當作 `"DONE"` 的問題；缺少明確終態（如 `status` 缺失或非終態且無明確完成／退出碼）統一標記為 `"unverified"`，使 `report_vs_audit.py` 對無終態 `exit=0` 聲明正確失敗。
+  - 將 `extract_calls_detailed()` 的單遍 FIFO 改成每輪（turn）雙階段批次配對：第一階段跨整批事件優先依 `tool_call_id`／`call_id`／`id` 配對具名結果（失敗／中斷但找不到前置啟動步驟的孤立事件另記為 `unmatched_results` 避免被吞掉），第二階段再將剩餘匿名結果 1:1 配對尚未結案槽位，解決同一 turn 內「有 ID 與無 ID 混合步驟」互相錯配的問題。
+  - 新增 `load_transcript_steps_with_sources()`：對主 `transcript.jsonl` 與伴隨 `transcript_full.jsonl` 各僅讀取一次並計算 SHA-256／bytes／lines，寫入 `source.transcripts` 供稽核清單完整溯源。
+
+### 安裝狀態保留、並行鎖與零中斷工具升級（P1 / P2）
+- **`tools/agy_setup.py`、`agy_setup_check.py`、`agy_doctor.py`、`plugin/director-work/scripts/seatbelt_hook.py`**：
+  - **設定保留與快速會話路徑**：新增 `.agydw_setup_state.json` 狀態檔並搭配從 `.agents/hooks.json` 反推既定參數（`infer_options_from_hooks()`）；執行 `--register-director`／`--revoke-session` 等維護指令時保留既有 `--guard-mode`（如 `block`）、`--enforce-resume`、`--overwrite-utf8` 與自訂 `--audit-log`／`--resume-file`／`--bridge-state` 路徑，無結構變更時不重寫 `.agents/hooks.json`／`.agents/plugins.json`。
+  - **並行註冊互斥鎖**：比照上游 `audit_log.py` 以 `os.O_CREAT | os.O_EXCL` 實作 `file_lock()`（預設等待 15 秒、陳舊鎖門檻 30 秒），保護 `.sessions.json` 與完整 `--apply` 提交，消除同時註冊多筆會話時的 lost update 競態。
+  - **零中斷 Side-by-Side 升級**：工具改先寫入並驗證版本化目錄 `tools_v<VER>_<HASH8>`，再原子切換 `.agents/hooks.json` 指向該版本化目錄，最後才更新相容層 `<DIRECTOR>/tools/` 並保留 `.tools_backup_*` 回滾備份。
+  - **跨目錄節點衝突預檢與誠實錯誤語義**：`validate_target_path_types()` 在寫入前先檢查目標路徑節點型別衝突（檔案 vs 目錄）；若通過預檢後在 OS 寫入階段發生 I/O 例外則誠實回報錯誤。
+  - **舊版 `director_work.json` 遷移與非 ASCII 倉庫雜湊防撞**：`plan_director_config_migration()` 替舊設定補上 `project_git_common_dir` 與 `director_worktree`（同時保留所有未知／自訂欄位）；`default_director_dir()` 對含非 ASCII 字元的倉庫名附加 8 碼路徑雜湊（`DIRECTOR-<slug>-<hash8>`），`agy_setup_check.py --strict` 亦將缺少 `project_git_common_dir` 的 git 專案標為 shadow。
+
+### 最終閘門、Worktree Stop 綁定與用量歸屬（P1 / P2）
+- **`tools/gate_check.py`**：`--final` 預設拒絕只有 `ENTRY_POINT`／`started` 而缺少明確成功完成證據（`EXIT_CODE: 0`／`exit=0`／`RESULT: PASS`／`VERDICT: PASS`）的 `evidence/E2E/` 紀錄（除非明確傳入 `--allow-incomplete-e2e`）；另支援 `--candidate <40HEX>` 檢查通過的 E2E 證據是否引用該候選提交（前 7+ 碼）。
+- **`tools/agy_hook_bridge.py`**：新增 `_git_common_dir()` 與 `resolve_stop_repo()`，當 Stop 事件帶入同一個 Git 倉庫底層物件庫的 `cwd` 或 `workspacePaths[0]`（含 worker linked worktree）時優先用於定位該工作區上下文。
+- **`tools/agy_usage.py`**：若 session transcript 含結構化 `workspacePaths`／`cwd`／`workspace` 欄位，要求精確歸屬該工作區，不再因 `USER_INPUT` 文字提及而誤歸他案；同時在報告輸出 `attribution_mode`／`attribution_modes` 並於退回 `text_heuristic` 時提示。
+
+### 文件、Skills 與雙平台 CI 對齊
+- 全部 5 份 `plugin/director-work/skills/*/SKILL.md` 統一採用 `python -B -I -X utf8 <RULES>/tools/...` 與 `<DIRECTOR>/**/RESUME_STATE*.md` 單專案 glob，並修正 `dw-dispatch` 中 Worktree「獨立 clone」用詞為「隔離 Git worktree（底層共用 `.git` 物件庫）」。
+- 更新 `tools/AGY-TOOLS.md`、`README.md`、`ANTIGRAVITY-PORT.md` 版號與工具數量盤點（`40` `.py` ＋ `2` `.json`），並在 GitHub Actions 加入無 `python` 別名、僅保留 `python3` 的 Ubuntu 自檢步驟。
+- 自檢套件擴增為 25 組（含 12 輪雙程序並行註冊壓測與 skills/文件一致性檢查），保留上游 `39/39` 核心檔案與 `v2.6.0` 位元完全一致。
+
 ## 2.6.0-agy.3（2026-11-24）
 
 針對獨立深度審查發現的「候選提交／執行終態／專案歸屬」三大綁定漏洞與 11 項實測缺陷進行徹底根治，並全面保留 39/39 份上游 `DIRECTOR-WORK v2.6.0` 核心檔 SHA-256 一致：

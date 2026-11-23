@@ -3,35 +3,39 @@
 
 Idempotently wires a project repository for Antigravity Director/Worker governance WITHOUT
 modifying user-global ~/.gemini/config/config.json:
-  1. Adds local-only paths (`AGENTS.local.md`, `.agents/hooks.local.json`, `_work/`) into the
-     Git common-dir exclude (`git rev-parse --git-path info/exclude` — works for linked worktrees too).
-  2. Scaffolds/upgrades a per-project `<WS>/DIRECTOR-<repo>/` folder (bound to the repo's Git
-     common-dir fingerprint so sibling repos never collide, while linked worktrees share the
-     project's DIRECTOR), plus `<DIRECTOR>/.sessions.json` (`default: "worker"`) and hashed/
-     versioned `tools/` with rollback backups on upgrades.
-  3. Non-destructively merges <REPO>/.agents/hooks.json (PreToolUse -> agy_guard.py with --protect
-     and --sessions, PostToolUse -> agy_audit.py + agy_hook_bridge.py, SessionStart, PreInvocation,
-     Stop) and <REPO>/.agents/plugins.json (replacing any older director-work plugin path in-place).
-  4. Validates all inputs in an atomic pre-flight before writing a single file.
+  1. Pre-flight validates repo, rules root, project ownership, all target path types (files vs
+     directories), existing .agents/*.json syntax, and .sessions.json BEFORE writing any byte.
+  2. Persists chosen guard options in <DIRECTOR>/.agydw_setup_state.json so maintenance commands
+     (like `--register-director <CID>`) preserve --guard-mode, --enforce-resume, and custom paths.
+  3. Uses a cross-process file lock for .sessions.json and apply commits so concurrent registration
+     calls never overwrite each other's entries.
+  4. Installs tools into side-by-side versioned directories (<DIRECTOR>/tools_v<VER>_<HASH8>/) and
+     switches .agents/hooks.json atomically before updating compatibility <DIRECTOR>/tools/.
+  5. Migrates legacy v2.6.0-agy.1/.2 director_work.json to include `project_git_common_dir` while
+     preserving all custom/unknown fields, and disambiguates non-ASCII project folder names.
 
 Usage:
   python -B -I -X utf8 agy_setup.py --repo <REPO> [--director <DIR>] [--init-director] [--apply]
 """
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
 import os
 import pathlib
+import random
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 LOCAL_EXCLUDES = ("AGENTS.local.md", ".agents/hooks.local.json", "_work/")
 MANIFEST_NAME = "AGYDW_TOOLS_MANIFEST.json"
+SETUP_STATE_NAME = ".agydw_setup_state.json"
 
 
 def read_version(rules_root):
@@ -41,7 +45,7 @@ def read_version(rules_root):
         txt = vf.read_text(encoding="utf-8-sig", errors="replace").strip()
         if txt:
             return txt
-    return "2.6.0-agy.3"
+    return "2.6.0-agy.4"
 
 
 def _norm_path_key(path_str):
@@ -49,6 +53,39 @@ def _norm_path_key(path_str):
         return os.path.normcase(pathlib.Path(path_str).resolve().as_posix())
     except (OSError, ValueError):
         return os.path.normcase(str(path_str).replace("\\", "/"))
+
+
+@contextlib.contextmanager
+def file_lock(lock_path, wait_s=15.0, stale_s=30.0):
+    """Cross-process exclusive lock file via O_CREAT|O_EXCL (Windows & POSIX)."""
+    lp = pathlib.Path(lock_path)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            fd = os.open(str(lp), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"{os.getpid()} {time.time():.3f}\n".encode("ascii"))
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lp.stat().st_mtime > stale_s:
+                    lp.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= end:
+                raise RuntimeError(f"timed out waiting for lock {lp.as_posix()} after {wait_s:g}s")
+            time.sleep(0.015 + random.random() * 0.025)
+    try:
+        yield
+    finally:
+        try:
+            lp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def git_dir(repo):
@@ -143,11 +180,12 @@ def resolve_rules_root(rules_arg, explicit_rules):
                 candidates.append(pathlib.Path(mdata["rules_root"]))
         except (OSError, ValueError):
             pass
-    parent_state = HERE.parent / "DIRECTOR_STATE.md"
-    if parent_state.is_file():
-        m = re.search(r"^[ \t]*RULES_PATH[ \t]*:[ \t]*(.+)$", parent_state.read_text(encoding="utf-8-sig", errors="replace"), re.M)
-        if m and m.group(1).strip():
-            candidates.append(pathlib.Path(m.group(1).strip()))
+    for probe_dir in (HERE.parent, HERE.parent.parent):
+        st_f = probe_dir / "DIRECTOR_STATE.md"
+        if st_f.is_file():
+            m = re.search(r"^[ \t]*RULES_PATH[ \t]*:[ \t]*(.+)$", st_f.read_text(encoding="utf-8-sig", errors="replace"), re.M)
+            if m and m.group(1).strip():
+                candidates.append(pathlib.Path(m.group(1).strip()))
 
     seen = set()
     for c in candidates:
@@ -223,14 +261,20 @@ def director_matches_repo(director_dir, repo):
 
 
 def default_director_dir(repo):
-    """Choose safe per-project DIRECTOR-<repo> path while smoothly upgrading matching legacy DIRECTOR/."""
+    """Choose safe per-project DIRECTOR-<repo> path (with stable hash for non-ASCII names; reuses legacy DIRECTOR/)."""
     primary = primary_repo_root(repo)
     legacy = primary.parent / "DIRECTOR"
     if legacy.is_dir() and ((legacy / "DIRECTOR_STATE.md").is_file() or (legacy / "director_work.json").is_file()):
         ok, _ = director_matches_repo(legacy, repo)
         if ok:
             return legacy
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", primary.name).strip("-") or "project"
+    raw_name = primary.name
+    ascii_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip("-")
+    if not ascii_slug or any(ord(ch) > 127 for ch in raw_name):
+        h8 = hashlib.sha256(raw_name.encode("utf-8")).hexdigest()[:8]
+        slug = f"{ascii_slug}-{h8}" if ascii_slug else f"project-{h8}"
+    else:
+        slug = ascii_slug
     return primary.parent / f"DIRECTOR-{slug}"
 
 
@@ -260,70 +304,117 @@ def compute_tools_hashes(tools_src):
     return hashes
 
 
-def managed_tools_status(director_dir, rules_root):
-    """Determine if <DIRECTOR>/tools is 'missing', 'stale', or 'current' relative to rules_root/tools."""
-    dst = pathlib.Path(director_dir) / "tools"
-    src = pathlib.Path(rules_root) / "tools"
-    if not dst.is_dir():
-        return "missing", None, compute_tools_hashes(src)
-    expected = compute_tools_hashes(src)
-    manifest_p = dst / MANIFEST_NAME
-    old_ver = "legacy"
-    if not manifest_p.is_file():
-        return "stale", old_ver, expected
+def versioned_tools_dirname(version_str, expected_hashes):
+    """Compute collision-free side-by-side tools directory name."""
+    ver_clean = re.sub(r"[^A-Za-z0-9._-]+", "_", version_str or "unknown")
+    digest8 = hashlib.sha256(json.dumps(expected_hashes, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    return f"tools_v{ver_clean}_{digest8}"
+
+
+def _dir_matches_manifest(folder, version_str, expected_hashes):
+    d = pathlib.Path(folder)
+    if not d.is_dir():
+        return False, "missing"
+    mp = d / MANIFEST_NAME
+    if not mp.is_file():
+        return False, "legacy"
     try:
-        mdata = json.loads(manifest_p.read_text(encoding="utf-8-sig"))
+        mdata = json.loads(mp.read_text(encoding="utf-8-sig"))
         old_ver = str(mdata.get("version") or "unknown")
     except (OSError, ValueError):
-        return "stale", "corrupt-manifest", expected
-    if old_ver != read_version(rules_root):
-        return "stale", old_ver, expected
-    for fname, want_sha in expected.items():
-        fp = dst / fname
+        return False, "corrupt-manifest"
+    if old_ver != version_str:
+        return False, old_ver
+    for fname, want_sha in expected_hashes.items():
+        fp = d / fname
         if not fp.is_file():
-            return "stale", old_ver, expected
+            return False, old_ver
         if hashlib.sha256(fp.read_bytes()).hexdigest() != want_sha:
-            return "stale", old_ver, expected
-    return "current", old_ver, expected
+            return False, old_ver
+    return True, old_ver
 
 
-def sync_managed_tools(director_dir, rules_root, expected_hashes):
-    """Verify staged copy of tools/, back up existing version for rollback, and atomically swap into place."""
+def managed_tools_status(director_dir, rules_root):
+    """Inspect both versioned side-by-side dir and compat <DIRECTOR>/tools/ status."""
+    src = pathlib.Path(rules_root) / "tools"
+    expected = compute_tools_hashes(src)
+    ver = read_version(rules_root)
+    d = pathlib.Path(director_dir)
+    ver_dir = d / versioned_tools_dirname(ver, expected)
+    compat_dir = d / "tools"
+
+    ver_ok, _ = _dir_matches_manifest(ver_dir, ver, expected)
+    compat_ok, old_compat_ver = _dir_matches_manifest(compat_dir, ver, expected)
+    if not compat_dir.is_dir():
+        status = "missing" if not ver_ok else "compat_missing"
+    elif not compat_ok or not ver_ok:
+        status = "stale"
+    else:
+        status = "current"
+    return status, old_compat_ver, expected, ver_dir
+
+
+def _build_verified_tools_staging(director_dir, rules_root, expected_hashes, ver):
     d = pathlib.Path(director_dir)
     src = pathlib.Path(rules_root) / "tools"
-    dst = d / "tools"
-    staging = d / f".tools_staging_{os.getpid()}"
+    staging = d / f".tools_staging_{os.getpid()}_{random.randint(1000, 9999)}"
     if staging.exists():
         shutil.rmtree(staging)
     d.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, staging, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "fixtures", MANIFEST_NAME))
-
-    # Verify every staged file matches expected SHA-256 before switching
     for fname, want_sha in expected_hashes.items():
         sf = staging / fname
         if not sf.is_file() or hashlib.sha256(sf.read_bytes()).hexdigest() != want_sha:
             shutil.rmtree(staging, ignore_errors=True)
             raise RuntimeError(f"staged tools integrity check failed for {fname}")
-
     manifest = {
         "schema_version": 1,
-        "version": read_version(rules_root),
+        "version": ver,
         "rules_root": pathlib.Path(rules_root).resolve().as_posix(),
         "installed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "files": expected_hashes,
     }
     write_json_atomic(staging / MANIFEST_NAME, manifest)
+    return staging
 
+
+def stage_versioned_tools(director_dir, rules_root, expected_hashes, ver_dir):
+    """Ensure side-by-side versioned tools dir exists and passes SHA-256 verification without disturbing old hooks."""
+    ver = read_version(rules_root)
+    ok, _ = _dir_matches_manifest(ver_dir, ver, expected_hashes)
+    if ok:
+        return False
+    staging = _build_verified_tools_staging(director_dir, rules_root, expected_hashes, ver)
+    old_stale = None
+    if ver_dir.exists():
+        old_stale = ver_dir.with_name(f".old_{ver_dir.name}_{os.getpid()}")
+        if old_stale.exists():
+            shutil.rmtree(old_stale, ignore_errors=True)
+        os.replace(ver_dir, old_stale)
+    try:
+        os.replace(staging, ver_dir)
+    except OSError:
+        if old_stale and old_stale.exists() and not ver_dir.exists():
+            os.replace(old_stale, ver_dir)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    if old_stale and old_stale.exists():
+        shutil.rmtree(old_stale, ignore_errors=True)
+    return True
+
+
+def sync_compat_tools_dir(director_dir, rules_root, expected_hashes):
+    """Update compatibility <DIRECTOR>/tools/ after hooks already point to side-by-side versioned dir, backing up old copy."""
+    d = pathlib.Path(director_dir)
+    dst = d / "tools"
+    ver = read_version(rules_root)
+    ok, old_ver = _dir_matches_manifest(dst, ver, expected_hashes)
+    if ok:
+        return None
+    staging = _build_verified_tools_staging(director_dir, rules_root, expected_hashes, ver)
     backup = None
     if dst.exists():
-        old_ver = "legacy"
-        old_m = dst / MANIFEST_NAME
-        if old_m.is_file():
-            try:
-                old_ver = str(json.loads(old_m.read_text(encoding="utf-8-sig")).get("version") or "legacy")
-            except (OSError, ValueError):
-                old_ver = "legacy"
-        old_ver_clean = re.sub(r"[^A-Za-z0-9._-]+", "_", old_ver)
+        old_ver_clean = re.sub(r"[^A-Za-z0-9._-]+", "_", str(old_ver or "legacy"))
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         backup = d / f".tools_backup_{old_ver_clean}_{ts}"
         idx = 1
@@ -331,7 +422,6 @@ def sync_managed_tools(director_dir, rules_root, expected_hashes):
             backup = d / f".tools_backup_{old_ver_clean}_{ts}_{idx}"
             idx += 1
         os.replace(dst, backup)
-
     try:
         os.replace(staging, dst)
     except OSError:
@@ -388,20 +478,177 @@ def build_sessions_config(sessions_path, register_directors, revoke_sessions):
     return merged, changed
 
 
-def build_hooks_config(args, rules_root, director_dir, use_copied_tools, sessions_path):
+def _flag_passed(argv_list, *names):
+    for arg in argv_list:
+        for nm in names:
+            if arg == nm or arg.startswith(nm + "="):
+                return True
+    return False
+
+
+def _split_cmd_tokens(cmd_str):
+    if not cmd_str:
+        return []
+    toks = []
+    cur = []
+    quote = None
+    for ch in cmd_str:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                cur.append(ch)
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch.isspace():
+            if cur:
+                toks.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        toks.append("".join(cur))
+    return toks
+
+
+def _extract_opt(tokens, flag):
+    for i, t in enumerate(tokens):
+        if t == flag and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if t.startswith(flag + "="):
+            return t.split("=", 1)[1]
+    return None
+
+
+def _extract_all_opts(tokens, flag):
+    out = []
+    for i, t in enumerate(tokens):
+        if t == flag and i + 1 < len(tokens):
+            out.append(tokens[i + 1])
+        elif t.startswith(flag + "="):
+            out.append(t.split("=", 1)[1])
+    return out
+
+
+def infer_options_from_hooks(hooks_file, repo, director_dir, dir_active):
+    """Best-effort inference of previously chosen guard options from existing .agents/hooks.json."""
+    inferred = {}
+    if not hooks_file.is_file():
+        return inferred
+    try:
+        hdata = json.loads(hooks_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return inferred
+    if not isinstance(hdata, dict):
+        return inferred
+
+    guard_grp = hdata.get("agydw-guard") if isinstance(hdata.get("agydw-guard"), dict) else {}
+    g_cmd = ""
+    for blk in guard_grp.get("PreToolUse") or []:
+        if isinstance(blk, dict):
+            for hk in blk.get("hooks") or []:
+                if isinstance(hk, dict) and isinstance(hk.get("command"), str):
+                    g_cmd = hk["command"]
+                    break
+            if g_cmd:
+                break
+    if g_cmd:
+        gtoks = _split_cmd_tokens(g_cmd)
+        mode = _extract_opt(gtoks, "--mode")
+        if mode in ("remind", "ask", "block"):
+            inferred["guard_mode"] = mode
+        prof = _extract_opt(gtoks, "--profile")
+        if prof in ("worker", "director"):
+            inferred["profile"] = prof
+        if "--overwrite-utf8" in gtoks:
+            inferred["overwrite_utf8"] = True
+        def_audit = (director_dir / "audit" / "{worktree}.jsonl") if (director_dir and dir_active) else (pathlib.Path(repo) / ".agents" / "audit_{worktree}.jsonl")
+        aud = _extract_opt(gtoks, "--audit")
+        if aud and _norm_path_key(aud) != _norm_path_key(def_audit):
+            inferred["audit_log"] = aud
+        def_state = (director_dir / ".bridge_state") if (director_dir and dir_active) else (pathlib.Path(repo) / ".agents" / ".bridge_state")
+        bst = _extract_opt(gtoks, "--bridge-state")
+        if bst and _norm_path_key(bst) != _norm_path_key(def_state):
+            inferred["bridge_state"] = bst
+        def_sess = (director_dir / ".sessions.json") if (director_dir and dir_active) else None
+        sess = _extract_opt(gtoks, "--sessions")
+        if sess and (def_sess is None or _norm_path_key(sess) != _norm_path_key(def_sess)):
+            inferred["sessions"] = sess
+        prots = _extract_all_opts(gtoks, "--protect")
+        if prots:
+            extras = [p for p in prots if not (director_dir and _norm_path_key(p) == _norm_path_key(director_dir))]
+            if extras:
+                inferred["protect"] = extras
+
+    bridge_grp = hdata.get("agydw-audit-and-bridge") if isinstance(hdata.get("agydw-audit-and-bridge"), dict) else {}
+    for hk in bridge_grp.get("Stop") or []:
+        if isinstance(hk, dict) and isinstance(hk.get("command"), str):
+            stoks = _split_cmd_tokens(hk["command"])
+            if "--enforce-resume" in stoks:
+                inferred["enforce_resume"] = True
+            def_res = (director_dir / "RESUME_STATE.md") if (director_dir and dir_active) else (pathlib.Path(repo) / "RESUME_STATE.md")
+            res = _extract_opt(stoks, "--resume")
+            if res and _norm_path_key(res) != _norm_path_key(def_res):
+                inferred["resume_file"] = res
+            break
+    return inferred
+
+
+def load_persisted_options(director_dir, hooks_file, repo, dir_active):
+    """Load persisted setup options from .agydw_setup_state.json (falling back to hooks.json inference)."""
+    state_p = pathlib.Path(director_dir) / SETUP_STATE_NAME
+    if state_p.is_file():
+        try:
+            data = json.loads(state_p.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                return data
+        except (OSError, ValueError):
+            pass
+    return infer_options_from_hooks(hooks_file, repo, director_dir, dir_active)
+
+
+def resolve_effective_args(a, argv_list, saved):
+    """Preserve saved setup options unless the user explicitly overrides them on CLI."""
+    eff = argparse.Namespace(**vars(a))
+    if saved:
+        if not _flag_passed(argv_list, "--guard-mode") and saved.get("guard_mode") in ("remind", "ask", "block"):
+            eff.guard_mode = saved["guard_mode"]
+        if not _flag_passed(argv_list, "--profile") and saved.get("profile") in ("worker", "director"):
+            eff.profile = saved["profile"]
+        if not _flag_passed(argv_list, "--enforce-resume") and "enforce_resume" in saved:
+            eff.enforce_resume = bool(saved["enforce_resume"])
+        if not _flag_passed(argv_list, "--overwrite-utf8") and "overwrite_utf8" in saved:
+            eff.overwrite_utf8 = bool(saved["overwrite_utf8"])
+        if not _flag_passed(argv_list, "--no-copy-tools") and "no_copy_tools" in saved:
+            eff.no_copy_tools = bool(saved["no_copy_tools"])
+        for attr, flag in (
+            ("audit_log", "--audit-log"),
+            ("resume_file", "--resume-file"),
+            ("bridge_state", "--bridge-state"),
+            ("sessions", "--sessions"),
+        ):
+            if not _flag_passed(argv_list, flag) and saved.get(attr):
+                setattr(eff, attr, saved[attr])
+        if not _flag_passed(argv_list, "--protect") and isinstance(saved.get("protect"), list):
+            eff.protect = list(saved["protect"])
+    return eff
+
+
+def build_hooks_config(args, tools_dir, director_dir):
     """Build Antigravity .agents/hooks.json dictionary with absolute Python & script paths."""
     py = q(sys.executable)
     if os.name == "nt" and py.startswith('"'):
         py = f"call {py}"
-    tools_dir = (director_dir / "tools") if (director_dir and use_copied_tools) else (rules_root / "tools")
-    guard = q(tools_dir / "agy_guard.py")
-    rules_json = q(tools_dir / "guard_rules.json")
-    audit = q(tools_dir / "agy_audit.py")
-    bridge = q(tools_dir / "agy_hook_bridge.py")
+    tdir = pathlib.Path(tools_dir)
+    guard = q(tdir / "agy_guard.py")
+    rules_json = q(tdir / "guard_rules.json")
+    audit = q(tdir / "agy_audit.py")
+    bridge = q(tdir / "agy_hook_bridge.py")
 
     state_dir = q(args.bridge_state or (director_dir / ".bridge_state" if director_dir else pathlib.Path(args.repo) / ".agents" / ".bridge_state"))
     resume_path = q(args.resume_file or (director_dir / "RESUME_STATE.md" if director_dir else pathlib.Path(args.repo) / "RESUME_STATE.md"))
     audit_log = q(args.audit_log or (director_dir / "audit" / "{worktree}.jsonl" if director_dir else pathlib.Path(args.repo) / ".agents" / "audit_{worktree}.jsonl"))
+    sess_arg = args.sessions or (director_dir / ".sessions.json" if director_dir else None)
 
     guard_parts = [f"{py} -B -I -X utf8 {guard} --rules {rules_json} --profile {args.profile} --mode {args.guard_mode}"]
     protect_dirs = []
@@ -413,8 +660,8 @@ def build_hooks_config(args, rules_root, director_dir, use_copied_tools, session
             protect_dirs.append(ep)
     for pd in protect_dirs:
         guard_parts.append(f"--protect {q(pd)}")
-    if sessions_path:
-        guard_parts.append(f"--sessions {q(sessions_path)}")
+    if sess_arg:
+        guard_parts.append(f"--sessions {q(sess_arg)}")
     guard_parts.append(f"--audit {audit_log}")
     guard_parts.append(f"--bridge-state {state_dir}")
     if args.overwrite_utf8:
@@ -541,6 +788,32 @@ def plan_director_scaffold(director_dir, rules_root, repo):
     return subdirs, writes
 
 
+def plan_director_config_migration(director_dir, repo):
+    """Migrate legacy v2.6.0-agy.1/.2 director_work.json to include project_git_common_dir preserving custom keys."""
+    cfg_dst = pathlib.Path(director_dir) / "director_work.json"
+    if not cfg_dst.is_file():
+        return None
+    common_d = git_common_dir(repo)
+    if common_d is None:
+        return None
+    try:
+        cfg = json.loads(cfg_dst.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    changed_fields = []
+    if not isinstance(cfg.get("project_git_common_dir"), str) or not cfg["project_git_common_dir"].strip():
+        cfg["project_git_common_dir"] = common_d.as_posix()
+        changed_fields.append("project_git_common_dir")
+    if not isinstance(cfg.get("director_worktree"), str) or not cfg["director_worktree"].strip():
+        cfg["director_worktree"] = primary_repo_root(repo).as_posix()
+        changed_fields.append("director_worktree")
+    if not changed_fields:
+        return None
+    return cfg_dst, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", f"MIGRATE {cfg_dst.as_posix()} (+{', '.join(changed_fields)})"
+
+
 def merge_hooks_config(hooks_file, hooks_obj):
     """Non-destructively merge agydw hook groups into existing .agents/hooks.json."""
     try:
@@ -614,9 +887,40 @@ def merge_plugins_config(plugins_file, plugin_parent, repo_path, old_rules_roots
     return merged, preserved_count, changed, replaced_dw
 
 
+def validate_target_path_types(repo, director_dir, dir_active, sessions_path, excl, plugin_parent):
+    """Fail cleanly in pre-flight if any required directory/file slot collides with the wrong filesystem node type."""
+    agents_dir = pathlib.Path(repo) / ".agents"
+    if agents_dir.exists() and not agents_dir.is_dir():
+        return f"path conflict: {agents_dir.as_posix()} exists and is not a directory"
+    for fp in (agents_dir / "hooks.json", agents_dir / "plugins.json" if plugin_parent.is_dir() else None):
+        if fp is not None and fp.exists() and fp.is_dir():
+            return f"path conflict: {fp.as_posix()} exists as a directory (expected JSON file)"
+    if excl is not None:
+        if excl.parent.exists() and not excl.parent.is_dir():
+            return f"path conflict: {excl.parent.as_posix()} exists and is not a directory"
+        if excl.exists() and excl.is_dir():
+            return f"path conflict: {excl.as_posix()} exists as a directory (expected exclude file)"
+    if dir_active:
+        d = pathlib.Path(director_dir)
+        if d.exists() and not d.is_dir():
+            return f"path conflict: {d.as_posix()} exists and is not a directory"
+        for sd in ("orders", "reviews", "research", "evidence", "audit", "tools"):
+            sub = d / sd
+            if sub.exists() and not sub.is_dir():
+                return f"path conflict: {sub.as_posix()} exists and is not a directory"
+    if sessions_path:
+        sp = pathlib.Path(sessions_path)
+        if sp.parent.exists() and not sp.parent.is_dir():
+            return f"path conflict: {sp.parent.as_posix()} exists and is not a directory"
+        if sp.exists() and sp.is_dir():
+            return f"path conflict: {sp.as_posix()} exists as a directory (expected JSON file)"
+    return None
+
+
 def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", required=True, help="target project git repository")
     ap.add_argument("--director", help="DIRECTOR folder path (default: <PRIMARY_REPO>/../DIRECTOR-<repo>; reuses matching legacy DIRECTOR/)")
@@ -640,11 +944,11 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true", help="replace whole .agents/hooks.json / plugins.json instead of merging")
     ap.add_argument("--apply", action="store_true", help="write files after pre-flight succeeds (default: dry-run)")
     try:
-        a = ap.parse_args(argv)
+        a = ap.parse_args(argv_list)
     except SystemExit as stop:
         return 0 if stop.code in (0, None) else 2
 
-    explicit_rules = any(arg == "--rules" or arg.startswith("--rules=") for arg in (argv if argv is not None else sys.argv[1:]))
+    explicit_rules = _flag_passed(argv_list, "--rules")
     repo = pathlib.Path(a.repo).resolve()
     if not repo.is_dir():
         print(f"AGY_SETUP: FAIL repo directory not found: {repo}", file=sys.stderr)
@@ -668,6 +972,15 @@ def main(argv=None):
         )
         return 1
 
+    dir_active = bool(a.director or a.init_director or director_dir.is_dir())
+    agents_dir = repo / ".agents"
+    hooks_file = agents_dir / "hooks.json"
+    plugins_file = agents_dir / "plugins.json"
+
+    # Load persisted setup options so maintenance reruns (e.g. --register-director) preserve chosen guardrails
+    saved_opts = load_persisted_options(director_dir, hooks_file, repo, dir_active)
+    eff = resolve_effective_args(a, argv_list, saved_opts)
+
     old_info = director_owner_info(director_dir)
     old_rules_roots = [old_info.get("rules_path")]
     old_manifest = director_dir / "tools" / MANIFEST_NAME
@@ -677,15 +990,56 @@ def main(argv=None):
         except (OSError, ValueError):
             pass
 
-    dir_active = bool(a.director or a.init_director or director_dir.is_dir())
-    has_existing_tools = (director_dir / "tools").is_dir()
-    should_sync_tools = (not a.no_copy_tools) and dir_active and (a.init_director or has_existing_tools) and (
+    has_existing_tools = (director_dir / "tools").is_dir() or any(director_dir.glob("tools_v*")) if director_dir.is_dir() else False
+    should_sync_tools = (not eff.no_copy_tools) and dir_active and (a.init_director or has_existing_tools) and (
         _norm_path_key(rules_root / "tools") != _norm_path_key(director_dir / "tools")
     )
-    use_copied_tools = (not a.no_copy_tools) and (should_sync_tools or has_existing_tools)
-    sessions_path = pathlib.Path(a.sessions).resolve() if a.sessions else (director_dir / ".sessions.json" if dir_active else None)
+    use_copied_tools = (not eff.no_copy_tools) and (should_sync_tools or has_existing_tools)
+    sessions_path = pathlib.Path(eff.sessions).resolve() if eff.sessions else (director_dir / ".sessions.json" if dir_active else None)
 
-    # Pre-flight 2: sessions role map validation
+    excl = git_exclude_file(repo)
+
+    # Pre-flight 2: strict target path-type check (file vs directory conflicts across repo & director)
+    path_err = validate_target_path_types(repo, director_dir, dir_active, sessions_path, excl, plugin_parent)
+    if path_err:
+        print(f"AGY_SETUP: FAIL {path_err}", file=sys.stderr)
+        return 1
+
+    # Session-only maintenance fast path (locked read-modify-write on .sessions.json without touching hooks)
+    structural_flags = (
+        "--init-director", "--force", "--guard-mode", "--profile", "--enforce-resume",
+        "--overwrite-utf8", "--audit-log", "--resume-file", "--bridge-state", "--protect",
+        "--plugin", "--no-copy-tools", "--rules",
+    )
+    if sessions_path and (a.register_director or a.revoke_session) and not _flag_passed(argv_list, *structural_flags):
+        tools_ok_for_fast = True
+        if should_sync_tools:
+            st_t, _, _, _ = managed_tools_status(director_dir, rules_root)
+            tools_ok_for_fast = (st_t == "current")
+        if hooks_file.is_file() and tools_ok_for_fast and (sessions_path.exists() or director_dir.is_dir()):
+            if a.apply:
+                with file_lock(sessions_path.with_name(sessions_path.name + ".lock")):
+                    try:
+                        s_obj, s_chg = build_sessions_config(sessions_path, a.register_director, a.revoke_session)
+                    except ValueError as exc:
+                        print(f"AGY_SETUP: FAIL {exc}", file=sys.stderr)
+                        return 1
+                    if s_chg:
+                        write_json_atomic(sessions_path, s_obj)
+                        print(f"APPLY MERGE {sessions_path.as_posix()} (director_sessions={len(s_obj['sessions'])})")
+                    else:
+                        print(f"APPLY OK {sessions_path.as_posix()} (director_sessions={len(s_obj['sessions'])})")
+            else:
+                try:
+                    s_obj, s_chg = build_sessions_config(sessions_path, a.register_director, a.revoke_session)
+                except ValueError as exc:
+                    print(f"AGY_SETUP: FAIL {exc}", file=sys.stderr)
+                    return 1
+                print(f"PLAN  {'MERGE' if s_chg else 'OK'} {sessions_path.as_posix()} (director_sessions={len(s_obj['sessions'])})")
+            print(f"AGY_SETUP: {'DONE' if a.apply else 'DRY_RUN'} director={director_dir.as_posix()} steps=1 (session-only)")
+            return 0
+
+    # Pre-flight 3: sessions role map dry validation
     sessions_obj = None
     sessions_changed = False
     if sessions_path:
@@ -695,13 +1049,19 @@ def main(argv=None):
             print(f"AGY_SETUP: FAIL {exc}", file=sys.stderr)
             return 1
 
-    # Pre-flight 3: managed tools status
-    tools_status, old_tools_ver, expected_hashes = (None, None, None)
+    # Pre-flight 4: managed tools status & target hooks tools_dir
+    tools_status, old_tools_ver, expected_hashes, ver_tools_dir = (None, None, None, None)
     if should_sync_tools:
-        tools_status, old_tools_ver, expected_hashes = managed_tools_status(director_dir, rules_root)
+        tools_status, old_tools_ver, expected_hashes, ver_tools_dir = managed_tools_status(director_dir, rules_root)
+        active_tools_dir = ver_tools_dir
+    elif use_copied_tools and saved_opts.get("active_tools_dir") and pathlib.Path(saved_opts["active_tools_dir"]).is_dir():
+        active_tools_dir = pathlib.Path(saved_opts["active_tools_dir"])
+    elif use_copied_tools:
+        active_tools_dir = director_dir / "tools"
+    else:
+        active_tools_dir = rules_root / "tools"
 
-    # Pre-flight 4: Git exclude calculation
-    excl = git_exclude_file(repo)
+    # Pre-flight 5: Git exclude calculation
     excl_missing = []
     excl_existing = ""
     if excl is not None:
@@ -709,7 +1069,7 @@ def main(argv=None):
         have = {line.strip() for line in excl_existing.splitlines()}
         excl_missing = [item for item in LOCAL_EXCLUDES if item not in have and item.rstrip("/") not in have]
 
-    # Pre-flight 5: DIRECTOR/ scaffold plan
+    # Pre-flight 6: DIRECTOR/ scaffold & legacy migration plan
     scaffold_dirs, scaffold_writes = ([], [])
     if a.init_director:
         try:
@@ -717,11 +1077,10 @@ def main(argv=None):
         except (OSError, ValueError) as exc:
             print(f"AGY_SETUP: FAIL cannot prepare DIRECTOR scaffold: {exc}", file=sys.stderr)
             return 1
+    migration_plan = plan_director_config_migration(director_dir, repo) if dir_active else None
 
-    # Pre-flight 6: .agents/hooks.json merge validation
-    agents_dir = repo / ".agents"
-    hooks_file = agents_dir / "hooks.json"
-    hooks_obj = build_hooks_config(a, rules_root, director_dir if dir_active else None, use_copied_tools, sessions_path)
+    # Pre-flight 7: .agents/hooks.json merge validation
+    hooks_obj = build_hooks_config(eff, active_tools_dir, director_dir if dir_active else None)
     hooks_write_data = hooks_obj
     if not hooks_file.exists() or a.force:
         hooks_action = f"WRITE {hooks_file.as_posix()}"
@@ -739,8 +1098,7 @@ def main(argv=None):
             hooks_action = f"OK {hooks_file.as_posix()} (already up to date; preserved {n_preserved} existing group(s))"
             hooks_should_write = False
 
-    # Pre-flight 7: .agents/plugins.json merge validation
-    plugins_file = agents_dir / "plugins.json"
+    # Pre-flight 8: .agents/plugins.json merge validation
     plugins_write_data = None
     plugins_should_write = False
     plugins_action = None
@@ -765,10 +1123,26 @@ def main(argv=None):
             else:
                 plugins_action = f"OK {plugins_file.as_posix()} (already registered; preserved {n_entries} existing entry/entries)"
 
-    # All pre-flight checks passed -> plan actions and (if --apply) commit writes
+    setup_state_payload = {
+        "schema_version": 1,
+        "guard_mode": eff.guard_mode,
+        "profile": eff.profile,
+        "enforce_resume": bool(eff.enforce_resume),
+        "overwrite_utf8": bool(eff.overwrite_utf8),
+        "no_copy_tools": bool(eff.no_copy_tools),
+        "audit_log": eff.audit_log,
+        "resume_file": eff.resume_file,
+        "bridge_state": eff.bridge_state,
+        "sessions": eff.sessions,
+        "protect": list(eff.protect or []),
+        "active_tools_dir": pathlib.Path(active_tools_dir).resolve().as_posix(),
+        "rules_root": rules_root.as_posix(),
+        "version": read_version(rules_root),
+    }
+
     actions = []
     notes = []
-    if a.profile == "director" and sessions_obj is not None and not any(
+    if eff.profile == "director" and sessions_obj is not None and not any(
         (v == "director" or (isinstance(v, dict) and v.get("profile") == "director"))
         for v in (sessions_obj.get("sessions") or {}).values()
     ):
@@ -777,57 +1151,85 @@ def main(argv=None):
             "run --register-director <CONVERSATION_ID> so the Director session can write DIRECTOR_LOG.md"
         )
 
-    if excl is not None:
-        if excl_missing:
+    def commit_all():
+        nonlocal excl_existing
+        if excl is not None and excl_missing:
             actions.append(f"APPEND {excl.as_posix()}: {', '.join(excl_missing)}")
             if a.apply:
                 excl.parent.mkdir(parents=True, exist_ok=True)
                 prefix = "" if (not excl_existing or excl_existing.endswith("\n")) else "\n"
                 with open(excl, "a", encoding="utf-8", newline="\n") as fh:
                     fh.write(prefix + "\n".join(excl_missing) + "\n")
-    else:
-        actions.append(f"NOTE {repo.as_posix()} is not a git repo; skipped .git/info/exclude")
+        elif excl is None:
+            actions.append(f"NOTE {repo.as_posix()} is not a git repo; skipped .git/info/exclude")
 
-    for sd in scaffold_dirs:
-        if not sd.is_dir():
-            actions.append(f"CREATE dir {sd.as_posix()}")
+        for sd in scaffold_dirs:
+            if not sd.is_dir():
+                actions.append(f"CREATE dir {sd.as_posix()}")
+                if a.apply:
+                    sd.mkdir(parents=True, exist_ok=True)
+        for dst, content, label in scaffold_writes:
+            actions.append(label)
             if a.apply:
-                sd.mkdir(parents=True, exist_ok=True)
-    for dst, content, label in scaffold_writes:
-        actions.append(label)
-        if a.apply:
-            write_text_atomic(dst, content)
+                write_text_atomic(dst, content)
+        if migration_plan is not None:
+            m_dst, m_txt, m_lbl = migration_plan
+            actions.append(m_lbl)
+            if a.apply:
+                write_text_atomic(m_dst, m_txt)
 
-    if should_sync_tools:
-        dst_tools = director_dir / "tools"
-        ver = read_version(rules_root)
-        if tools_status == "missing":
-            actions.append(f"COPY tools/ ({ver}) -> {dst_tools.as_posix()}")
-        elif tools_status == "stale":
-            actions.append(f"UPGRADE tools/ ({old_tools_ver} -> {ver}) -> {dst_tools.as_posix()}")
-        else:
-            actions.append(f"OK tools/ ({ver}) up to date at {dst_tools.as_posix()}")
-        if a.apply and tools_status in ("missing", "stale"):
-            backup = sync_managed_tools(director_dir, rules_root, expected_hashes)
+        # Zero-downtime tools install: 1) stage & verify side-by-side versioned dir BEFORE touching hooks.json
+        if should_sync_tools:
+            ver = read_version(rules_root)
+            if tools_status == "missing":
+                actions.append(f"COPY tools/ ({ver}) -> {ver_tools_dir.as_posix()}")
+            elif tools_status == "stale":
+                actions.append(f"UPGRADE tools/ ({old_tools_ver} -> {ver}) -> {ver_tools_dir.as_posix()}")
+            else:
+                actions.append(f"OK tools/ ({ver}) up to date at {ver_tools_dir.as_posix()}")
+            if a.apply:
+                stage_versioned_tools(director_dir, rules_root, expected_hashes, ver_tools_dir)
+
+        # Locked read-merge-write on .sessions.json so concurrent callers never lose registrations
+        if sessions_path:
+            if a.apply:
+                with file_lock(sessions_path.with_name(sessions_path.name + ".lock")):
+                    live_sess, live_chg = build_sessions_config(sessions_path, a.register_director, a.revoke_session)
+                    if live_chg:
+                        write_json_atomic(sessions_path, live_sess)
+                        actions.append(f"{'MERGE' if sessions_path.exists() else 'WRITE'} {sessions_path.as_posix()} (default={live_sess['default']}, director_sessions={len(live_sess['sessions'])})")
+                    else:
+                        actions.append(f"OK {sessions_path.as_posix()} (director_sessions={len(live_sess['sessions'])})")
+            else:
+                if sessions_changed:
+                    actions.append(f"{'MERGE' if sessions_path.exists() else 'WRITE'} {sessions_path.as_posix()} (default={sessions_obj['default']}, director_sessions={len(sessions_obj['sessions'])})")
+                else:
+                    actions.append(f"OK {sessions_path.as_posix()} (director_sessions={len(sessions_obj['sessions'])})")
+
+        # 2) Atomically switch hooks.json (pointing at already-verified versioned tools dir) and plugins.json
+        actions.append(hooks_action)
+        if a.apply and hooks_should_write:
+            write_json_atomic(hooks_file, hooks_write_data)
+
+        if plugins_action:
+            actions.append(plugins_action)
+            if a.apply and plugins_should_write:
+                write_json_atomic(plugins_file, plugins_write_data)
+
+        # 3) Update compatibility <DIRECTOR>/tools/ & rollback backup AFTER hooks already point safely to versioned dir
+        if should_sync_tools and a.apply and tools_status in ("missing", "stale", "compat_missing"):
+            backup = sync_compat_tools_dir(director_dir, rules_root, expected_hashes)
             if backup is not None:
                 actions.append(f"BACKUP previous tools/ -> {backup.as_posix()}")
 
-    if sessions_path:
-        if sessions_changed:
-            actions.append(f"{'MERGE' if sessions_path.exists() else 'WRITE'} {sessions_path.as_posix()} (default={sessions_obj['default']}, director_sessions={len(sessions_obj['sessions'])})")
-            if a.apply:
-                write_json_atomic(sessions_path, sessions_obj)
-        else:
-            actions.append(f"OK {sessions_path.as_posix()} (director_sessions={len(sessions_obj['sessions'])})")
+        if dir_active and a.apply:
+            write_json_atomic(director_dir / SETUP_STATE_NAME, setup_state_payload)
 
-    actions.append(hooks_action)
-    if a.apply and hooks_should_write:
-        write_json_atomic(hooks_file, hooks_write_data)
-
-    if plugins_action:
-        actions.append(plugins_action)
-        if a.apply and plugins_should_write:
-            write_json_atomic(plugins_file, plugins_write_data)
+    if a.apply and dir_active:
+        with file_lock(director_dir / ".agydw_setup.lock"):
+            commit_all()
+    else:
+        commit_all()
 
     for act in actions:
         print(("APPLY " if a.apply else "PLAN  ") + act)

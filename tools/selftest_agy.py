@@ -568,6 +568,10 @@ def test_governance_tools_roundtrip():
         work_dir = tmp / "work"
         wo_work = work_dir / "WO-001"
         wo_work.mkdir(parents=True)
+        py_bin = pathlib.Path(PYTHON).as_posix()
+        py_tok = f'"{py_bin}"' if " " in py_bin else py_bin
+        py_cmd_str = f"{py_tok} -B -m unittest tests.test_demo"
+        py_cmd_json = json.dumps([py_bin, "-B", "-m", "unittest", "tests.test_demo"])
         wo = director / "orders" / "WO-001-sub.md"
         wo.write_text(
             f"""# WO-001 — sub
@@ -613,11 +617,11 @@ FORBIDDEN:
 ## E. 驗收條件
 | ID | 類型 | 要求 | 驗證方法 | 預期 |
 |---|---|---|---|---|
-| AC-1 | AUTO | 單元測試通過 | `python -B -m unittest tests.test_demo` | exit 0 |
+| AC-1 | AUTO | 單元測試通過 | `{py_cmd_str}` | exit 0 |
 
 ```text
 CHECKS:
-- AC-1: ["python", "-B", "-m", "unittest", "tests.test_demo"]
+- AC-1: {py_cmd_json}
 ```
 
 ```text
@@ -673,7 +677,7 @@ CHECKS:
         evid_dir = director / "evidence"
         run_py(TOOLS_DIR / "evidence_record.py", [
             "run", "--label", "AC-1", "--order", str(wo), "--cwd", str(repo), "--out-dir", str(evid_dir),
-            "--", "python", "-B", "-m", "unittest", "tests.test_demo",
+            "--", py_bin, "-B", "-m", "unittest", "tests.test_demo",
         ], cwd=repo, check_zero=True)
         ev_json = next(evid_dir.glob("*-AC-1.json"))
 
@@ -699,7 +703,7 @@ RESULT: PASS
   PERFORMANCE: NOT_RUN
   STABILITY: PASS
 DONE: src/demo.py 新增 sub(a, b)
-TESTS: python -B -m unittest tests.test_demo (OK)
+TESTS: {py_cmd_str} (OK)
 {sc_last}
 {pc_line}
 EVIDENCE: {ev_json.name}
@@ -721,7 +725,7 @@ NEXT: 送總監驗收
             encoding="utf-8",
             newline="\n",
         )
-        run_py(TOOLS_DIR / "ran_line.py", ["--to", str(report), "--exit", "0", "--cmd", "python -B -m unittest tests.test_demo"], check_zero=True)
+        run_py(TOOLS_DIR / "ran_line.py", ["--to", str(report), "--exit", "0", "--cmd", py_cmd_str], check_zero=True)
 
         run_py(TOOLS_DIR / "gate_check.py", [
             "--match", str(report), str(wo),
@@ -743,7 +747,7 @@ SESSION_ID: coord-1
 PASS
 分面向：工程 PASS / 成品 PASS / 效能 NOT_RUN / 穩定性 PASS / 整合 PASS / PO 驗收：未做（保留給 PO）
 下一步：ACCEPT_AND_CLOSE
-- `python -B -m unittest tests.test_demo` exit=0 at=01:18
+- `{py_cmd_str}` exit=0 at=01:18
 
 ## B. 已證實成果
 | 項目 | 證據路徑 | 證據等級 | 依 worker 報告？ |
@@ -1396,6 +1400,8 @@ def test_session_role_binding_and_upgrade():
         assert "UPGRADE tools/" in up.stdout and "UPGRADE " in up.stdout, up.stdout
         assert copied_guard.read_bytes() == (TOOLS_DIR / "agy_guard.py").read_bytes(), "stale guard copy was not upgraded"
         assert list(ddir.glob(".tools_backup_*")), "missing rollback tools backup directory"
+        ver_dirs = list(ddir.glob("tools_v*"))
+        assert ver_dirs and "tools_v" in json.loads((repo / ".agents" / "hooks.json").read_text("utf-8"))["agydw-guard"]["PreToolUse"][0]["hooks"][0]["command"], ver_dirs
         plugs = json.loads((repo / ".agents" / "plugins.json").read_text("utf-8"))["entries"]
         assert len(plugs) == 2 and plugs[0]["path"].endswith("other-plugin") and plugs[1]["path"].endswith("/plugin"), plugs
 
@@ -1543,6 +1549,338 @@ def test_stop_bridge_rotation_usage_and_worktree_posix():
     return f"stop/rotation/usage/posix-fallback + bounded tail scan ({peak_mib:.2f} MiB peak) OK"
 
 
+def test_audit_missing_status_mixed_batch_and_full_manifest():
+    with tempfile.TemporaryDirectory(prefix="agydw_aud_p1_") as td:
+        tmp = pathlib.Path(td)
+        now_str = "2026-11-24T04:10:00+00:00"
+        # 1. Missing 'status' without exit code must stay unverified and manifest must record primary + transcript_full.jsonl
+        tr_dir = tmp / "logs1"
+        tr_dir.mkdir()
+        tr_main = tr_dir / "transcript.jsonl"
+        tr_full = tr_dir / "transcript_full.jsonl"
+        tr_main.write_text(
+            json.dumps({
+                "step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": now_str,
+                "tool_calls": [{"id": "call-missing", "name": "run_command", "args": {"CommandLine": "python -m pytest"}}],
+            }) + "\n" +
+            json.dumps({
+                "step_index": 1, "type": "GENERIC", "created_at": now_str,
+                "tool_call_id": "call-missing", "truncated_fields": ["content"], "content": "partial...",
+            }) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        tr_full.write_text(
+            json.dumps({
+                "step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": now_str,
+                "tool_calls": [{"id": "call-missing", "name": "run_command", "args": {"CommandLine": "python -m pytest"}}],
+            }) + "\n" +
+            json.dumps({
+                "step_index": 1, "type": "GENERIC", "created_at": now_str,
+                "tool_call_id": "call-missing", "content": "stdout buffered without terminal status",
+            }) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        out_audit = tmp / "built_missing.jsonl"
+        res_b = run_py(TOOLS_DIR / "agy_audit.py", ["build", "--transcript", str(tr_main), "--out", str(out_audit), "--force"], check_zero=True)
+        lines = [json.loads(ln) for ln in out_audit.read_text("utf-8").splitlines() if ln.strip()]
+        hdr, entry = lines[0], lines[-1]
+        assert hdr["kind"] == "rebuild" and hdr["source"]["version"] == "2.6.0-agy.4", hdr
+        roles = {t["role"]: t for t in hdr["source"]["transcripts"]}
+        assert "primary" in roles and "full_companion" in roles, roles
+        assert roles["primary"]["sha256"] == hashlib.sha256(tr_main.read_bytes()).hexdigest(), roles
+        assert roles["full_companion"]["sha256"] == hashlib.sha256(tr_full.read_bytes()).hexdigest(), roles
+        assert entry["result"]["status"] == "unverified", f"missing status must stay unverified: {entry}"
+
+        rep = tmp / "REP_MISSING.md"
+        rep.write_text("# TASK REPORT\nSESSION_ID: conv-miss\nRAN:\n", encoding="utf-8", newline="\n")
+        run_py(TOOLS_DIR / "ran_line.py", ["--to", str(rep), "--exit", "0", "--cmd", "python -m pytest"], check_zero=True)
+        rva = run_py(TOOLS_DIR / "report_vs_audit.py", ["--report", str(rep), "--log", str(out_audit)])
+        assert rva.returncode == 1, f"report_vs_audit must reject exit=0 when audit status is unverified: {rva.stdout}"
+
+        # 2. Mixed ID + anonymous results in one turn + unmatched orphan error preservation
+        tr_mix = tmp / "transcript_mix.jsonl"
+        tr_mix.write_text(
+            json.dumps({
+                "step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": now_str,
+                "tool_calls": [
+                    {"id": "c-anon", "name": "run_command", "args": {"CommandLine": "echo first"}},
+                    {"id": "c-named", "name": "run_command", "args": {"CommandLine": "echo second"}},
+                ],
+            }) + "\n" +
+            json.dumps({
+                "step_index": 1, "type": "GENERIC", "status": "ERROR", "created_at": now_str,
+                "tool_call_id": "c-named", "content": "exit code 1",
+            }) + "\n" +
+            json.dumps({
+                "step_index": 2, "type": "GENERIC", "status": "DONE", "created_at": now_str,
+                "content": "first finished ok exit code 0",
+            }) + "\n" +
+            json.dumps({
+                "step_index": 3, "type": "GENERIC", "status": "ERROR", "created_at": now_str,
+                "tool_call_id": "orphan-err", "content": "late orphan failure",
+            }) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        mix_out = tmp / "built_mix.jsonl"
+        mb = run_py(TOOLS_DIR / "agy_audit.py", ["build", "--transcript", str(tr_mix), "--out", str(mix_out), "--json"], check_zero=True)
+        mj = json.loads(mb.stdout)
+        assert mj["unmatched_results"] == 1 and mj["calls"] == 3, mj
+        mix_rows = [json.loads(ln) for ln in mix_out.read_text("utf-8").splitlines() if ln.strip()]
+        assert mix_rows[0]["source"]["unmatched_results"] == 1, mix_rows[0]
+        by_input = {row["input"]: row["result"]["status"] for row in mix_rows[1:]}
+        assert any("echo first" in k and v == "ok" for k, v in by_input.items()), by_input
+        assert any("echo second" in k and v == "error" for k, v in by_input.items()), by_input
+        assert any("orphan-err" in k and v == "error" for k, v in by_input.items()), by_input
+
+    return "missing status=unverified + full_companion manifest + mixed turn batch pairing + orphan error preservation OK"
+
+
+def test_setup_preserve_options_concurrent_lock_and_path_conflicts():
+    with tempfile.TemporaryDirectory(prefix="agydw_setup_p1_") as td:
+        tmp = pathlib.Path(td)
+        # 1. Pre-flight target path node conflicts leave zero writes
+        r_bad1 = tmp / "bad_agents"
+        r_bad1.mkdir()
+        (r_bad1 / ".agents").write_text("not a dir\n", encoding="utf-8", newline="\n")
+        p_b1 = run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(r_bad1), "--init-director", "--apply"])
+        assert p_b1.returncode != 0 and not (tmp / "DIRECTOR-bad_agents").exists(), p_b1.stdout + p_b1.stderr
+
+        r_bad2 = tmp / "bad_dir_file"
+        r_bad2.mkdir()
+        dir_file = tmp / "director_as_file"
+        dir_file.write_text("file\n", encoding="utf-8", newline="\n")
+        p_b2 = run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(r_bad2), "--director", str(dir_file), "--init-director", "--apply"])
+        assert p_b2.returncode != 0 and not (r_bad2 / ".agents" / "hooks.json").exists(), p_b2.stdout + p_b2.stderr
+
+        # 2. Option preservation across --register-director / --revoke-session + legacy inference + migration
+        repo = tmp / "my_app"
+        repo.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(repo)], check_zero=True)
+        custom_audit = (repo / "custom_audit" / "{worktree}.jsonl").as_posix()
+        run_py(TOOLS_DIR / "agy_setup.py", [
+            "--repo", str(repo), "--init-director", "--guard-mode", "block",
+            "--enforce-resume", "--audit-log", custom_audit, "--apply",
+        ], check_zero=True)
+        ddir = tmp / "DIRECTOR-my_app"
+        (ddir / "RESUME_STATE.md").write_text(
+            "PROGRESS: 10%\nDOING: harden setup\nNEXT_STEP: verify strict check\nCOMMS: ready\nUPDATED: 2026-11-24\n",
+            encoding="utf-8", newline="\n",
+        )
+        state_file = ddir / ".agydw_setup_state.json"
+        st_obj = json.loads(state_file.read_text("utf-8"))
+        assert st_obj["guard_mode"] == "block" and st_obj["enforce_resume"] is True and "tools_v" in st_obj["active_tools_dir"], st_obj
+
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--register-director", "dir-1", "--apply"], check_zero=True)
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--revoke-session", "dir-1", "--apply"], check_zero=True)
+        h_txt = (repo / ".agents" / "hooks.json").read_text("utf-8")
+        assert "--mode block" in h_txt and "--enforce-resume" in h_txt and "custom_audit/" in h_txt, h_txt
+
+        # Without state file: fallback inference from hooks.json still preserves options
+        state_file.unlink()
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--register-director", "dir-2", "--apply"], check_zero=True)
+        h_txt2 = (repo / ".agents" / "hooks.json").read_text("utf-8")
+        assert "--mode block" in h_txt2 and "--enforce-resume" in h_txt2 and "custom_audit/" in h_txt2, h_txt2
+
+        # Legacy director_work.json missing project_git_common_dir fails strict check then auto-migrates preserving custom keys
+        dw_cfg = ddir / "director_work.json"
+        cfg_data = json.loads(dw_cfg.read_text("utf-8"))
+        cfg_data.pop("project_git_common_dir", None)
+        cfg_data["custom_tag"] = "keep-me"
+        dw_cfg.write_text(json.dumps(cfg_data), encoding="utf-8", newline="\n")
+        sc_shadow = run_py(TOOLS_DIR / "agy_setup_check.py", ["--strict", str(ddir), "--repo", str(repo)])
+        assert sc_shadow.returncode != 0, f"missing project_git_common_dir must fail strict check: {sc_shadow.stdout}"
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--apply"], check_zero=True)
+        cfg_after = json.loads(dw_cfg.read_text("utf-8"))
+        assert cfg_after.get("project_git_common_dir") and cfg_after.get("custom_tag") == "keep-me", cfg_after
+        run_py(TOOLS_DIR / "agy_setup_check.py", ["--strict", str(ddir), "--repo", str(repo)], check_zero=True)
+
+        # 3. Non-ASCII sibling repos receive distinct hashed DIRECTOR dirs
+        u_a = tmp / "測試甲"
+        u_b = tmp / "測試乙"
+        for ur in (u_a, u_b):
+            ur.mkdir()
+            run_cmd(["git", "init", "-b", "main", str(ur)], check_zero=True)
+            run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(ur), "--init-director", "--apply"], check_zero=True)
+        u_dirs = sorted(p.name for p in tmp.glob("DIRECTOR-*") if p.name != "DIRECTOR-my_app")
+        assert len(u_dirs) == 2 and u_dirs[0] != u_dirs[1], u_dirs
+
+        # 4. 12 rounds of dual concurrent subprocess.Popen --register-director must never drop a session
+        for rnd in range(12):
+            cid_a = f"conc-a-{rnd}"
+            cid_b = f"conc-b-{rnd}"
+            p1 = subprocess.Popen(
+                [PYTHON, "-B", "-I", "-X", "utf8", str(TOOLS_DIR / "agy_setup.py"), "--repo", str(repo), "--register-director", cid_a, "--apply"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            )
+            p2 = subprocess.Popen(
+                [PYTHON, "-B", "-I", "-X", "utf8", str(TOOLS_DIR / "agy_setup.py"), "--repo", str(repo), "--register-director", cid_b, "--apply"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            )
+            out1, err1 = p1.communicate(timeout=30)
+            out2, err2 = p2.communicate(timeout=30)
+            assert p1.returncode == 0 and p2.returncode == 0, f"round {rnd}: rc=({p1.returncode},{p2.returncode}) err=({err1},{err2}) out=({out1},{out2})"
+            sess_map = json.loads((ddir / ".sessions.json").read_text("utf-8"))["sessions"]
+            assert cid_a in sess_map and cid_b in sess_map, f"round {rnd} dropped concurrent session: {list(sess_map)}"
+
+    return "path-conflict preflight + option preservation + legacy migration + non-ASCII isolation + 12x concurrent lock OK"
+
+
+def test_final_gate_incomplete_e2e_and_candidate_binding():
+    with tempfile.TemporaryDirectory(prefix="agydw_final_e2e_") as td:
+        tmp = pathlib.Path(td)
+        director = tmp / "DIRECTOR-final"
+        e2e_dir = director / "evidence" / "E2E"
+        e2e_dir.mkdir(parents=True)
+        (director / "usage.json").write_text(
+            json.dumps({"status": "OK", "totals": {"sessions": 1, "total_tokens": 500}, "sessions": []}),
+            encoding="utf-8", newline="\n",
+        )
+        rec = e2e_dir / "e2e_login.txt"
+        rec.write_text("ENTRY_POINT: src.app.main\nstatus=started\n", encoding="utf-8", newline="\n")
+
+        f_inc = run_py(TOOLS_DIR / "gate_check.py", ["--final", str(director), "--usage", str(director / "usage.json")])
+        assert f_inc.returncode != 0 and "E2E_INCOMPLETE" in f_inc.stdout, f_inc.stdout
+
+        run_py(TOOLS_DIR / "gate_check.py", [
+            "--final", str(director), "--usage", str(director / "usage.json"), "--allow-incomplete-e2e",
+        ], check_zero=True)
+
+        cand = "0123456789abcdef0123456789abcdef01234567"
+        rec.write_text("ENTRY_POINT: src.app.main\nEXIT_CODE: 0\nlogin flow ok\n", encoding="utf-8", newline="\n")
+        run_py(TOOLS_DIR / "gate_check.py", ["--final", str(director), "--usage", str(director / "usage.json")], check_zero=True)
+
+        f_cand_miss = run_py(TOOLS_DIR / "gate_check.py", [
+            "--final", str(director), "--usage", str(director / "usage.json"), "--candidate", cand,
+        ])
+        assert f_cand_miss.returncode != 0, f"expected failure without candidate reference: {f_cand_miss.stdout}"
+
+        rec.write_text(f"ENTRY_POINT: src.app.main\nCOMMIT: {cand[:12]}\nEXIT_CODE: 0\n", encoding="utf-8", newline="\n")
+        run_py(TOOLS_DIR / "gate_check.py", [
+            "--final", str(director), "--usage", str(director / "usage.json"), "--candidate", cand,
+        ], check_zero=True)
+
+        f_bad_sha = run_py(TOOLS_DIR / "gate_check.py", ["--final", str(director), "--candidate", "not-a-sha"])
+        assert f_bad_sha.returncode != 0, f_bad_sha.stdout + f_bad_sha.stderr
+
+    return "final gate rejects incomplete E2E by default + --allow-incomplete-e2e + --candidate SHA binding OK"
+
+
+def test_stop_worktree_priority_and_usage_structured_workspace():
+    with tempfile.TemporaryDirectory(prefix="agydw_wt_usage_") as td:
+        tmp = pathlib.Path(td)
+        main_repo = tmp / "main_repo"
+        main_repo.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(main_repo)], check_zero=True)
+        run_cmd(["git", "-C", str(main_repo), "config", "user.name", "Demo"], check_zero=True)
+        run_cmd(["git", "-C", str(main_repo), "config", "user.email", "demo@example.invalid"], check_zero=True)
+        (main_repo / "app.py").write_text("x = 1\n", encoding="utf-8", newline="\n")
+        run_cmd(["git", "-C", str(main_repo), "add", "-A"], check_zero=True)
+        run_cmd(["git", "-C", str(main_repo), "commit", "--date", "2020-01-01T00:00:00+00:00", "-m", "init"], check_zero=True)
+
+        wt_repo = tmp / "wt_worker"
+        run_cmd(["git", "-C", str(main_repo), "worktree", "add", "-b", "w1/feat", str(wt_repo)], check_zero=True)
+        (wt_repo / "app.py").write_text("x = 2\n", encoding="utf-8", newline="\n")
+
+        other_repo = tmp / "other_repo"
+        other_repo.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(other_repo)], check_zero=True)
+        run_cmd(["git", "-C", str(other_repo), "config", "user.name", "Demo"], check_zero=True)
+        run_cmd(["git", "-C", str(other_repo), "config", "user.email", "demo@example.invalid"], check_zero=True)
+        (other_repo / "o.py").write_text("y = 1\n", encoding="utf-8", newline="\n")
+        run_cmd(["git", "-C", str(other_repo), "add", "-A"], check_zero=True)
+        run_cmd(["git", "-C", str(other_repo), "commit", "--date", "2020-01-01T00:00:00+00:00", "-m", "other"], check_zero=True)
+        (other_repo / "o.py").write_text("y = 2\n", encoding="utf-8", newline="\n")
+
+        resume = tmp / "RESUME_STATE.md"
+        resume.write_text("PROGRESS: 1\nDOING: wt\nNEXT_STEP: finish\nCOMMS: ok\n", encoding="utf-8", newline="\n")
+        now_ts = time.time()
+        os.utime(resume, (now_ts, now_ts))
+        os.utime(wt_repo / "app.py", (now_ts + 60, now_ts + 60))
+        os.utime(other_repo / "o.py", (now_ts + 60, now_ts + 60))
+
+        state_other = tmp / "state_other"
+        pl_other = {"conversationId": "c-other", "terminationReason": "model_stop", "fullyIdle": True, "cwd": other_repo.as_posix()}
+        r_other = run_py(TOOLS_DIR / "agy_hook_bridge.py", [
+            "stop-check", "--resume", str(resume), "--repo", str(main_repo), "--state-dir", str(state_other), "--enforce-resume",
+        ], stdin_obj=pl_other, check_zero=True)
+        assert json.loads(r_other.stdout)["decision"] == "allow", f"cross-repo cwd must not hijack stop check: {r_other.stdout}"
+
+        state_wt = tmp / "state_wt"
+        pl_wt = {"conversationId": "c-wt", "terminationReason": "model_stop", "fullyIdle": True, "cwd": wt_repo.as_posix()}
+        r_wt = run_py(TOOLS_DIR / "agy_hook_bridge.py", [
+            "stop-check", "--resume", str(resume), "--repo", str(main_repo), "--state-dir", str(state_wt), "--enforce-resume",
+        ], stdin_obj=pl_wt, check_zero=True)
+        assert json.loads(r_wt.stdout)["decision"] == "continue", f"same-repo dirty linked worktree cwd must trigger continue: {r_wt.stdout}"
+
+        # Structured workspace attribution vs text heuristic
+        proj_a = tmp / "proj_a"
+        proj_b = tmp / "proj_b"
+        proj_a.mkdir()
+        proj_b.mkdir()
+        tr_struct = tmp / "tr_struct.jsonl"
+        tr_struct.write_text(
+            json.dumps({
+                "step_index": 0, "type": "USER_INPUT", "workspacePaths": [proj_a.as_posix()],
+                "content": f"Compare architecture against {proj_b.as_posix()} notes",
+            }) + "\n" +
+            json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 100, "output_tokens": 25}) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        u_miss = run_py(TOOLS_DIR / "agy_usage.py", ["--transcript", str(tr_struct), "--project-dir", str(proj_b), "--json"])
+        assert u_miss.returncode == 2 and json.loads(u_miss.stdout)["status"] == "NO_DATA", u_miss.stdout
+        u_hit = run_py(TOOLS_DIR / "agy_usage.py", ["--transcript", str(tr_struct), "--project-dir", str(proj_a), "--json"], check_zero=True)
+        uj = json.loads(u_hit.stdout)
+        assert uj["sessions"][0]["attribution_mode"] == "structured_workspace", uj
+
+        tr_heur = tmp / "tr_heur.jsonl"
+        tr_heur.write_text(
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "content": f"Work inside {proj_a.as_posix()}"}) + "\n" +
+            json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 50}) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        uh_json = json.loads(run_py(TOOLS_DIR / "agy_usage.py", ["--transcript", str(tr_heur), "--project-dir", str(proj_a), "--json"], check_zero=True).stdout)
+        assert uh_json["sessions"][0]["attribution_mode"] == "text_heuristic", uh_json
+        uh_txt = run_py(TOOLS_DIR / "agy_usage.py", ["--transcript", str(tr_heur), "--project-dir", str(proj_a)], check_zero=True).stdout
+        assert "text_heuristic" in uh_txt, uh_txt
+
+    return "linked-worktree stop priority + structured workspace usage attribution OK"
+
+
+def test_skills_and_docs_consistency():
+    ver = (ROOT_DIR / "VERSION").read_text("utf-8").strip()
+    assert ver, "empty VERSION file"
+    p_ver = json.loads((ROOT_DIR / "plugin" / "director-work" / "plugin.json").read_text("utf-8"))["version"]
+    assert p_ver == ver, f"plugin.json version {p_ver!r} != {ver!r}"
+    for rel in (
+        "plugin/director-work/rules/AGENTS.md",
+        "tools/AGY-TOOLS.md",
+        "ANTIGRAVITY-PORT.md",
+    ):
+        txt = (ROOT_DIR / rel).read_text("utf-8")
+        assert ver in txt, f"{rel} missing version {ver}"
+    chg_first_heading = next(
+        (ln.strip() for ln in (ROOT_DIR / "CHANGELOG.md").read_text("utf-8").splitlines() if ln.startswith("## ")),
+        "",
+    )
+    assert chg_first_heading.startswith(f"## {ver}"), f"CHANGELOG top heading {chg_first_heading!r} != ## {ver}"
+
+    skills = sorted((ROOT_DIR / "plugin" / "director-work" / "skills").glob("*/SKILL.md"))
+    assert len(skills) == 5, skills
+    for sp in skills:
+        stxt = sp.read_text("utf-8")
+        for bad in ("<DIRECTOR>/tools/", "../**", "獨立 clone"):
+            assert bad not in stxt, f"{sp.as_posix()} still contains forbidden text {bad!r}"
+        for ref in re.findall(r"tools/([A-Za-z0-9_.-]+\.(?:py|json))\b", stxt):
+            assert (TOOLS_DIR / ref).is_file(), f"{sp.as_posix()} references missing tools/{ref}"
+
+    py_cnt = len(list(TOOLS_DIR.glob("*.py")))
+    json_cnt = len(list(TOOLS_DIR.glob("*.json")))
+    agy_tools_txt = (TOOLS_DIR / "AGY-TOOLS.md").read_text("utf-8")
+    assert f"{py_cnt}" in agy_tools_txt and f"{json_cnt}" in agy_tools_txt, (py_cnt, json_cnt)
+
+    return f"version={ver}, 5 skills refs/phrases, and tools counts ({py_cnt} .py + {json_cnt} .json) consistent OK"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--verbose", "-v", action="store_true", help="print every passing check")
@@ -1571,6 +1909,11 @@ def main(argv=None):
     r.check("session_role_binding_and_upgrade", test_session_role_binding_and_upgrade)
     r.check("doctor_disabled_matcher_and_final_e2e_gate", test_doctor_disabled_matcher_and_final_e2e_gate)
     r.check("stop_bridge_rotation_usage_and_worktree_posix", test_stop_bridge_rotation_usage_and_worktree_posix)
+    r.check("audit_missing_status_mixed_batch_and_full_manifest", test_audit_missing_status_mixed_batch_and_full_manifest)
+    r.check("setup_preserve_options_concurrent_lock_and_path_conflicts", test_setup_preserve_options_concurrent_lock_and_path_conflicts)
+    r.check("final_gate_incomplete_e2e_and_candidate_binding", test_final_gate_incomplete_e2e_and_candidate_binding)
+    r.check("stop_worktree_priority_and_usage_structured_workspace", test_stop_worktree_priority_and_usage_structured_workspace)
+    r.check("skills_and_docs_consistency", test_skills_and_docs_consistency)
 
     print(f"SELFTEST_AGY_SUMMARY: pass={r.passed} skip={r.skipped} fail={r.failed}")
     return 1 if r.failed else 0

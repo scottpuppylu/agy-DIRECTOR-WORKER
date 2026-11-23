@@ -215,7 +215,8 @@ def _check_active_tools_version(cmd_line):
         repo_sha = hashlib.sha256(repo_guard.read_bytes()).hexdigest()
         if repo_sha != cur_guard_sha:
             return check_item("active_tools_version", "WARN", f"active agy_guard.py differs from {HERE.as_posix()}; re-run agy_setup.py --apply")
-    return check_item("active_tools_version", "OK", f"active tools version={inst_ver} at {tools_dir.as_posix()} (sha256={cur_guard_sha[:12]})")
+    mode_lbl = "versioned" if tools_dir.name.startswith("tools_v") else "compat"
+    return check_item("active_tools_version", "OK", f"active {mode_lbl} tools version={inst_ver} at {tools_dir.as_posix()} (sha256={cur_guard_sha[:12]})")
 
 
 def check_hooks_and_probe(repo, probe_hooks):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Antigravity hash-chained action audit & loop/injection scanner (2.6.0-agy.3).
+"""Antigravity hash-chained action audit & loop/injection scanner (2.6.0-agy.4).
 
 Reuses upstream tools/audit_log.py (hash chain, locking, verification), tools/loop_guard.py
 (loop detection), tools/inject_scan.py (prompt injection scanning), and tools/secret_mask.py
@@ -31,7 +31,7 @@ import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-REBUILD_VERSION = "2.6.0-agy.3"
+REBUILD_VERSION = "2.6.0-agy.4"
 READ_TOOLS = {"read_file", "view_file", "list_dir"}
 SUBAGENT_TOOLS = {"invoke_subagent", "swarm", "Agent", "Task"}
 TERMINAL_OK_STATUSES = {"DONE", "OK", "SUCCEEDED", "SUCCESS", "COMPLETED"}
@@ -250,15 +250,24 @@ def find_step_in_transcript(transcript_path, step_idx):
     return True, obj.get("status"), (content if isinstance(content, str) else "")
 
 
-def load_transcript_steps(transcript_path):
-    """Load steps from transcript.jsonl, resolving truncated steps from transcript_full.jsonl only when needed."""
+def load_transcript_steps_with_sources(transcript_path):
+    """Load steps from single snapshots of transcript.jsonl and (if read) companion transcript_full.jsonl."""
     tp = pathlib.Path(transcript_path)
     if not tp.is_file():
         raise FileNotFoundError(f"transcript not found: {tp}")
 
+    raw_main = tp.read_bytes()
+    sources = [{
+        "path": tp.resolve(),
+        "name": tp.name,
+        "role": "primary",
+        "sha256": hashlib.sha256(raw_main).hexdigest(),
+        "bytes": len(raw_main),
+    }]
+
     steps = []
     truncated_idxs = set()
-    for line in tp.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in raw_main.decode("utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
         try:
@@ -273,8 +282,16 @@ def load_transcript_steps(transcript_path):
     if truncated_idxs:
         full_path = tp.with_name("transcript_full.jsonl")
         if full_path.is_file() and full_path.resolve() != tp.resolve():
+            raw_full = full_path.read_bytes()
+            sources.append({
+                "path": full_path.resolve(),
+                "name": full_path.name,
+                "role": "full_companion",
+                "sha256": hashlib.sha256(raw_full).hexdigest(),
+                "bytes": len(raw_full),
+            })
             full_by_idx = {}
-            for line in full_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in raw_full.decode("utf-8", errors="replace").splitlines():
                 if not line.strip():
                     continue
                 try:
@@ -288,6 +305,12 @@ def load_transcript_steps(transcript_path):
                     full_by_idx[s["step_index"]] if (s.get("truncated_fields") and s.get("step_index") in full_by_idx) else s
                     for s in steps
                 ]
+    return steps, tp, sources
+
+
+def load_transcript_steps(transcript_path):
+    """Load steps from transcript.jsonl, resolving truncated steps from transcript_full.jsonl only when needed."""
+    steps, tp, _ = load_transcript_steps_with_sources(transcript_path)
     return steps, tp
 
 
@@ -355,65 +378,126 @@ def discover_transcripts(transcript_files, conversations, brain_roots, include_s
     return out
 
 
-def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
-    """Pair PLANNER_RESPONSE.tool_calls with subsequent GENERIC steps (correlation ID first, else FIFO)."""
-    steps, tp = load_transcript_steps(transcript_path)
-    pending = []
+def _build_call_record(conv_id, parent_cid, model_seen, tc, tc_id, p_step, p_ts, st, orphan=False):
+    """Build normalized audit call entry without defaulting missing status to DONE."""
+    if tc is not None:
+        raw_name = tc.get("name") or "?"
+        raw_args = parse_raw_args(tc)
+        tool, tool_raw, norm_input = normalize_tool_and_input(raw_name, raw_args)
+    else:
+        tool = "?"
+        tool_raw = "unmatched_result"
+        norm_input = {"unmatched_tool_call_id": tc_id} if tc_id else {"unmatched_step_index": st.get("step_index")}
+    content = st.get("content") or ""
+    status_val = st.get("status")
+    dur, is_err, is_int = parse_step_timing_and_error(content, status_val)
+    kind, res_status = classify_step_outcome(status_val, content)
+    ts_str = st.get("created_at") or p_ts
+    return {
+        "conv_id": conv_id,
+        "agent_id": conv_id if parent_cid else None,
+        "parent_id": parent_cid,
+        "step_idx": st.get("step_index"),
+        "planner_step": p_step,
+        "tc_id": tc_id,
+        "orphan": orphan,
+        "tool": tool,
+        "tool_raw": tool_raw,
+        "input_obj": norm_input,
+        "content": content,
+        "duration_ms": dur,
+        "is_err": is_err,
+        "is_int": is_int,
+        "kind": kind,
+        "result_status": res_status,
+        "ts_str": ts_str,
+        "ts_dt": parse_iso(ts_str),
+        "model": model_seen,
+    }
+
+
+def extract_calls_detailed(conv_id, transcript_path, parent_cid=None):
+    """Two-pass per-turn pairing: correlation ID first across the batch, then remaining anonymous slots."""
+    steps, tp, sources = load_transcript_steps_with_sources(transcript_path)
     calls = []
     no_result = 0
+    unmatched_results = 0
     model_seen = None
+
+    batch_pending = []
+    batch_generics = []
+    batch_model = None
+
+    def flush_batch():
+        nonlocal no_result, unmatched_results
+        if not batch_pending and not batch_generics:
+            return
+        used_p = [False] * len(batch_pending)
+        used_g = [False] * len(batch_generics)
+        emitted = []
+
+        # Pass 1: correlation ID matches first across the whole turn batch
+        for gi, (st, step_cid) in enumerate(batch_generics):
+            if not step_cid:
+                continue
+            match_pi = next((pi for pi, item in enumerate(batch_pending) if not used_p[pi] and item[1] == step_cid), None)
+            used_g[gi] = True
+            if match_pi is not None:
+                used_p[match_pi] = True
+                tc, tc_id, p_step, p_ts = batch_pending[match_pi]
+                emitted.append(_build_call_record(conv_id, parent_cid, batch_model, tc, tc_id or step_cid, p_step, p_ts, st))
+            else:
+                unmatched_results += 1
+                rec = _build_call_record(conv_id, parent_cid, batch_model, None, step_cid, None, st.get("created_at"), st, orphan=True)
+                if rec["result_status"] in ("error", "interrupted"):
+                    emitted.append(rec)
+
+        # Pass 2: pair remaining anonymous results strictly with remaining unused pending calls
+        rem_p = [pi for pi, u in enumerate(used_p) if not u]
+        rem_g = [gi for gi, u in enumerate(used_g) if not u]
+        for pi, gi in zip(rem_p, rem_g):
+            used_p[pi] = True
+            used_g[gi] = True
+            tc, tc_id, p_step, p_ts = batch_pending[pi]
+            st, _ = batch_generics[gi]
+            emitted.append(_build_call_record(conv_id, parent_cid, batch_model, tc, tc_id, p_step, p_ts, st))
+
+        for gi, u in enumerate(used_g):
+            if not u:
+                unmatched_results += 1
+                st, _ = batch_generics[gi]
+                rec = _build_call_record(conv_id, parent_cid, batch_model, None, None, None, st.get("created_at"), st, orphan=True)
+                if rec["result_status"] in ("error", "interrupted"):
+                    emitted.append(rec)
+
+        no_result += sum(1 for u in used_p if not u)
+        emitted.sort(key=lambda c: c["step_idx"] if c["step_idx"] is not None else 0)
+        calls.extend(emitted)
+        batch_pending.clear()
+        batch_generics.clear()
 
     for st in steps:
         stype = st.get("type")
         if stype == "PLANNER_RESPONSE":
+            flush_batch()
             if st.get("model"):
                 model_seen = st.get("model")
-            no_result += len(pending)
-            pending.clear()
-            tcs = st.get("tool_calls") or []
-            for tc in tcs:
+            batch_model = model_seen
+            for tc in st.get("tool_calls") or []:
                 if isinstance(tc, dict):
                     tc_id = _extract_call_id(tc, ("id", "call_id", "tool_call_id", "toolCallId", "tool_use_id"))
-                    pending.append((tc, tc_id, st.get("step_index"), st.get("created_at")))
-        elif stype == "GENERIC" and pending:
+                    batch_pending.append((tc, tc_id, st.get("step_index"), st.get("created_at")))
+        elif stype == "GENERIC" and batch_pending:
             step_cid = _extract_call_id(st, ("tool_call_id", "toolCallId", "call_id", "callId", "tool_use_id"))
-            if step_cid:
-                match_idx = next((i for i, item in enumerate(pending) if item[1] == step_cid), None)
-                if match_idx is None:
-                    continue
-                tc, tc_id, p_step, p_ts = pending.pop(match_idx)
-            else:
-                tc, tc_id, p_step, p_ts = pending.pop(0)
-            raw_name = tc.get("name") or "?"
-            raw_args = parse_raw_args(tc)
-            tool, tool_raw, norm_input = normalize_tool_and_input(raw_name, raw_args)
-            content = st.get("content") or ""
-            status_val = st.get("status") if "status" in st else "DONE"
-            dur, is_err, is_int = parse_step_timing_and_error(content, status_val)
-            kind, res_status = classify_step_outcome(status_val, content)
-            ts_str = st.get("created_at") or p_ts
-            calls.append({
-                "conv_id": conv_id,
-                "agent_id": conv_id if parent_cid else None,
-                "parent_id": parent_cid,
-                "step_idx": st.get("step_index"),
-                "planner_step": p_step,
-                "tc_id": tc_id or step_cid,
-                "tool": tool,
-                "tool_raw": tool_raw,
-                "input_obj": norm_input,
-                "content": content,
-                "duration_ms": dur,
-                "is_err": is_err,
-                "is_int": is_int,
-                "kind": kind,
-                "result_status": res_status,
-                "ts_str": ts_str,
-                "ts_dt": parse_iso(ts_str),
-                "model": model_seen,
-            })
+            batch_generics.append((st, step_cid))
 
-    no_result += len(pending)
+    flush_batch()
+    return calls, no_result, unmatched_results, tp, sources
+
+
+def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
+    """Pair PLANNER_RESPONSE.tool_calls with subsequent GENERIC steps (two-pass ID-first)."""
+    calls, no_result, _, tp, _ = extract_calls_detailed(conv_id, transcript_path, parent_cid=parent_cid)
     return calls, no_result, tp
 
 
@@ -498,20 +582,23 @@ def cmd_build(args):
     all_calls = []
     source_meta = []
     total_no_result = 0
-    for cid, tp, _ in sources:
+    total_unmatched = 0
+    for cid, tp, parent_cid in sources:
         try:
-            calls, no_res, resolved = extract_calls_from_transcript(cid, tp, parent_cid=_)
-            raw_bytes = resolved.read_bytes()
+            calls, no_res, unm_res, _, src_recs = extract_calls_detailed(cid, tp, parent_cid=parent_cid)
         except OSError as exc:
             print(f"AGY_AUDIT: CANNOT_RUN {tp}: {exc}", file=sys.stderr)
             return 2
         total_no_result += no_res
-        source_meta.append({
-            "conversation_id": cid,
-            "name": resolved.name,
-            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-            "bytes": len(raw_bytes),
-        })
+        total_unmatched += unm_res
+        for srec in src_recs:
+            source_meta.append({
+                "conversation_id": cid,
+                "name": srec["name"],
+                "role": srec["role"],
+                "sha256": srec["sha256"],
+                "bytes": srec["bytes"],
+            })
         all_calls.extend(calls)
 
     if not all_calls:
@@ -537,6 +624,7 @@ def cmd_build(args):
             "transcripts": source_meta,
             "lines": len(all_calls),
             "no_result": total_no_result,
+            "unmatched_results": total_unmatched,
         },
         "prev": audit.GENESIS,
     }
@@ -583,11 +671,12 @@ def cmd_build(args):
             "calls": len(all_calls),
             "conversations": len(sources),
             "no_result": total_no_result,
+            "unmatched_results": total_unmatched,
             "head_seq": entries[-1]["seq"],
             "head_sha": head_sha,
         }, ensure_ascii=False))
     else:
-        print(f"AGY_AUDIT file={out_path.as_posix()} lines={len(entries)} calls={len(all_calls)} conversations={len(sources)} no_result={total_no_result}")
+        print(f"AGY_AUDIT file={out_path.as_posix()} lines={len(entries)} calls={len(all_calls)} conversations={len(sources)} no_result={total_no_result} unmatched={total_unmatched}")
         print(f"AUDIT_HEAD file={out_path.as_posix()} seq={entries[-1]['seq']} sha={head_sha}")
     return 0
 

@@ -1,6 +1,6 @@
 # ANTIGRAVITY-PORT — `DIRECTOR-WORK v2.6.0` 到 Antigravity 的設計對照與實證紀錄
 
-本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.3`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的原生平台能力轉化為實質治理優勢。
+本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.4`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的平台能力轉化為實質治理優勢。
 
 ---
 
@@ -90,7 +90,7 @@
 
 - **Plugin 結構 (`plugin/director-work/`)**：
   - `plugin.json`：對齊官方 `https://antigravity.google/schemas/v1/plugin.json`（含字串 `repository` 與 `$schema`），附 3 條繁體中文建議啟動詞。
-  - `hooks.json` ＋ `scripts/seatbelt_hook.py`：外掛獨立複製時仍可開箱攔截憑證讀取與 `G00`/`G01`/`G02`，透過 `python ... || python3 ...` 相容無 `python` 別名之 POSIX 環境；若存在 `DIRECTOR-<repo>/tools/`、`DIRECTOR/tools/` 或 repo `tools/` 則委派完整 `agy_guard.py`。
+  - `hooks.json` ＋ `scripts/seatbelt_hook.py`：外掛獨立複製時仍可開箱攔截憑證讀取與 `G00`/`G01`/`G02`，透過 `python ... || python3 ...` 相容無 `python` 別名之 POSIX 環境；若存在 `.agydw_setup_state.json`、`DIRECTOR-<repo>/tools_v*`、`DIRECTOR-<repo>/tools/` 或 repo `tools/` 則優先委派版本化 `agy_guard.py`（並透過 `.agydw_setup_state.json` 與兩階段稽核配對維持安裝升級與結果真實性）。
   - `skills/`（5 個按需技能）：`dw-bootstrap`、`dw-dispatch`、`dw-review-gate`、`dw-resume`、`dw-release`。
   - `agents/`（3 個專屬子代理）：`dw-worker.md`（寫作施工）、`dw-blind-reviewer.md`（鎖定 `tools: [read_file]`、`inheritMcp: false`、`inheritCustomizations: false`）、`dw-visual-qa.md`（強調 `BROWSER_HOST_FACTS` 與跨畫面比較）。
 - **Workflow Fan-Out 範本 (`templates/workflows/`)**：

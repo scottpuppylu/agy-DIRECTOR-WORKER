@@ -64,21 +64,91 @@ def compile_project_patterns(project_norm_list):
     return patterns
 
 
-def matches_project(steps, project_patterns):
-    """True if any USER_INPUT or tool call args inside steps references one of project_patterns."""
-    if not project_patterns:
-        return True
+def _norm_ws_path(val):
+    if not isinstance(val, str) or not val.strip():
+        return None
+    s = val.strip().replace("\\", "/")
+    if len(s) >= 2 and s[1] == ":":
+        s = s[0].lower() + s[1:]
+    return s.rstrip("/") or "/"
+
+
+def extract_structured_workspaces(steps):
+    """Extract normalized workspace/cwd paths from structured metadata fields on transcript steps."""
+    out = []
+    seen = set()
+
+    def add_val(v):
+        if isinstance(v, str):
+            nv = _norm_ws_path(v)
+            low = nv.lower() if nv else None
+            if low and low not in seen:
+                seen.add(low)
+                out.append(low)
+        elif isinstance(v, list):
+            for item in v:
+                add_val(item)
+
+    ws_keys = ("workspacePaths", "workspace_paths", "workspace", "workspacePath", "cwd", "project_dir", "projectDir")
+    for st in steps:
+        if not isinstance(st, dict):
+            continue
+        for k in ws_keys:
+            if k in st and st[k] is not None:
+                add_val(st[k])
+        meta = st.get("metadata")
+        if isinstance(meta, dict):
+            for k in ws_keys:
+                if k in meta and meta[k] is not None:
+                    add_val(meta[k])
+        if st.get("type") == "PLANNER_RESPONSE":
+            for tc in st.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                raw = tc.get("args") if tc.get("args") is not None else tc.get("arguments")
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except ValueError:
+                        raw = {}
+                if isinstance(raw, dict):
+                    for k in ("Cwd", "cwd", "workspace"):
+                        if k in raw and raw[k] is not None:
+                            add_val(raw[k])
+    return out
+
+
+def classify_project_match(steps, project_norm_list, project_patterns):
+    """Prefer structured workspace attribution over text heuristics; prevent cross-project mention leaks."""
+    if not project_patterns and not project_norm_list:
+        return True, "unfiltered"
+
+    ws_paths = extract_structured_workspaces(steps)
+    targets = [p.rstrip("/").lower() for p in (project_norm_list or []) if p.strip()]
+    if ws_paths:
+        for wp in ws_paths:
+            for tgt in targets:
+                if wp == tgt or wp.startswith(tgt + "/") or tgt.startswith(wp + "/"):
+                    return True, "structured_workspace"
+        return False, "structured_workspace_mismatch"
+
     for st in steps:
         stype = st.get("type")
         if stype == "USER_INPUT":
             txt = (st.get("content") or "").replace("\\", "/").lower()
             if any(rx.search(txt) for rx in project_patterns):
-                return True
+                return True, "text_heuristic"
         elif stype == "PLANNER_RESPONSE":
             txt = json.dumps(st.get("tool_calls") or [], ensure_ascii=False).replace("\\", "/").lower()
             if any(rx.search(txt) for rx in project_patterns):
-                return True
-    return False
+                return True, "text_heuristic"
+    return False, "no_match"
+
+
+def matches_project(steps, project_patterns, project_norm_list=None):
+    """Backwards-compatible boolean project attribution helper."""
+    ok, _ = classify_project_match(steps, project_norm_list, project_patterns)
+    return ok
 
 
 def safe_int_metric(val, invalid_counts, field_name):
@@ -242,11 +312,15 @@ def main(argv=None):
             row = summarize_conversation(cid, tp, parent_cid, agy_audit)
         except OSError:
             continue
-        if a.project_dir and not parent_cid and not matches_project(row["_steps"], proj_patterns):
-            continue
-        # If parent matched project, its discovered child subagents are kept; if standalone subagent filter:
-        if a.project_dir and parent_cid and parent_cid not in seen_cids and not matches_project(row["_steps"], proj_patterns):
-            continue
+        if a.project_dir:
+            matched, attr_mode = classify_project_match(row["_steps"], proj_norms, proj_patterns)
+            if not parent_cid and not matched:
+                continue
+            if parent_cid and parent_cid not in seen_cids and not matched:
+                continue
+            row["attribution_mode"] = attr_mode if matched else "inherited_parent"
+        else:
+            row["attribution_mode"] = "unfiltered"
         sdate = row["started_date"]
         if a.since and sdate != "UNKNOWN" and sdate < a.since:
             continue
@@ -316,8 +390,10 @@ def main(argv=None):
             if out_tmp.is_file():
                 loops_summary = json.loads(out_tmp.read_text(encoding="utf-8"))
 
+    attr_modes = collections.Counter(r.get("attribution_mode", "unfiltered") for r in rows)
     report = {
         "status": "OK",
+        "attribution_modes": dict(attr_modes),
         "totals": totals,
         "model_turns": dict(model_mix),
         "daily": dict(sorted(daily.items())),
@@ -347,6 +423,8 @@ def main(argv=None):
     if loops_summary:
         counts_txt = " ".join(f"{k}={v}" for k, v in (loops_summary.get("counts") or {}).items() if v) or "none"
         print(f"LOOPS: findings={loops_summary.get('findings_total', 0)} ({counts_txt}) events={loops_summary.get('events', 0)}")
+    if attr_modes.get("text_heuristic"):
+        print("NOTE: project attribution used text_heuristic (transcript lacked structured workspacePaths); pass --conversation for exact cross-project comparisons")
     return 0
 
 

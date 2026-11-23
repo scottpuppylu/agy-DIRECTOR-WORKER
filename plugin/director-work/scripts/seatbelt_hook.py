@@ -63,10 +63,24 @@ def find_full_guard(payload):
     roots = [r for r in (ws[0] if ws and isinstance(ws[0], str) else None, cwd) if r]
     for root in roots:
         p = pathlib.Path(root)
-        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", p.name).strip("-") or "project"
-        candidates.append(p.parent / f"DIRECTOR-{slug}" / "tools")
-        candidates.append(p.parent / "DIRECTOR" / "tools")
-        candidates.append(p / "DIRECTOR" / "tools")
+        ascii_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", p.name).strip("-") or "project"
+        dir_candidates = [p.parent / f"DIRECTOR-{ascii_slug}", p.parent / "DIRECTOR", p / "DIRECTOR"]
+        for d_cand in sorted(p.parent.glob(f"DIRECTOR-{ascii_slug}*")) if p.parent.is_dir() else []:
+            if d_cand not in dir_candidates and d_cand.is_dir():
+                dir_candidates.append(d_cand)
+        for ddir in dir_candidates:
+            st_file = ddir / ".agydw_setup_state.json"
+            if st_file.is_file():
+                try:
+                    atd = json.loads(st_file.read_text(encoding="utf-8-sig")).get("active_tools_dir")
+                    if isinstance(atd, str) and atd.strip():
+                        candidates.append(pathlib.Path(atd))
+                except (OSError, ValueError):
+                    pass
+            for vd in sorted(ddir.glob("tools_v*"), reverse=True) if ddir.is_dir() else []:
+                if vd.is_dir():
+                    candidates.append(vd)
+            candidates.append(ddir / "tools")
     candidates.append(PLUGIN_DIR.parent.parent / "tools")
     for folder in candidates:
         g = folder / "agy_guard.py"

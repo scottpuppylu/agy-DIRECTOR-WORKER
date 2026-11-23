@@ -2005,6 +2005,7 @@ E2E_EXIT = re.compile(
     re.I | re.M,
 )
 E2E_FAIL_MARKER = re.compile(r"^[ \t]*(?:FAILED\b|FAIL\b|ERROR:|Traceback \(most recent call last\):)", re.M)
+E2E_PASS_MARKER = re.compile(r"^[ \t]*(?:RESULT|STATUS|VERDICT)[ \t]*[:=][ \t]*(?:PASS|OK|SUCCESS)\b", re.I | re.M)
 
 
 FEAS_FIELD = re.compile(r"^[ \t]*(FEASIBILITY|FEASIBLE_COUNT|SCRIPT|RESULT)[ \t]*[:=][ \t]*(.*?)[ \t]*$", re.M)
@@ -2083,8 +2084,8 @@ def feasibility_problems(path, notes):
     return problems
 
 
-def final_problems(folder, notes):
-    """2.2.5 (B5): final acceptance of a DIRECTOR folder (or a folder holding DIRECTOR/)."""
+def final_problems(folder, notes, allow_incomplete_e2e=False, candidate=None):
+    """2.2.5 / agy.4: final acceptance of a DIRECTOR folder requiring completed E2E outcome(s)."""
     base = pathlib.Path(folder)
     if not (base / "evidence").is_dir() and (base / "DIRECTOR").is_dir():
         base = base / "DIRECTOR"
@@ -2098,9 +2099,11 @@ def final_problems(folder, notes):
         texts = [(p, read_or_none(p) or "") for p in records]
         if not any(E2E_ENTRY.search(txt) for _, txt in texts):
             notes.append(f"WARN E2E: no record in {e2e} names its `ENTRY_POINT:` (the one public entry point it ran)")
-        saw_zero_exit = False
+        completed_texts = []
         e2e_failed = False
         for p, txt in texts:
+            file_failed = False
+            file_zero_exit = False
             for xm in E2E_EXIT.finditer(txt):
                 code_str = next((g for g in xm.groups() if g is not None), None)
                 if code_str is None:
@@ -2109,14 +2112,26 @@ def final_problems(folder, notes):
                 if code != 0:
                     problems.append(f"E2E: {p.name} recorded non-zero exit code ({code})")
                     e2e_failed = True
+                    file_failed = True
                 else:
-                    saw_zero_exit = True
+                    file_zero_exit = True
             fm = E2E_FAIL_MARKER.search(txt)
             if fm:
                 problems.append(f"E2E: {p.name} contains failure marker ({fm.group(0).strip()})")
                 e2e_failed = True
-        if not e2e_failed and not saw_zero_exit:
-            notes.append(f"WARN E2E: no record in {e2e} explicitly states exit code 0 (e.g. `EXIT_CODE: 0`)")
+                file_failed = True
+            if not file_failed and (file_zero_exit or E2E_PASS_MARKER.search(txt)):
+                completed_texts.append((p, txt))
+        if not e2e_failed and not completed_texts:
+            msg = f"E2E_INCOMPLETE: no record in {e2e} contains an explicit completed outcome (e.g. `EXIT_CODE: 0` or `RESULT: PASS`)"
+            if allow_incomplete_e2e:
+                notes.append(f"WARN {msg}")
+            else:
+                problems.append(msg)
+        if candidate and completed_texts:
+            prefix = candidate[:7].lower()
+            if not any(prefix in txt.lower() for _, txt in completed_texts):
+                problems.append(f"E2E: no completed record in {e2e} references candidate commit {candidate[:12]}")
     register = base / "DECISION_REGISTER.md"
     text = read_or_none(register) if register.is_file() else None
     if text is None:
@@ -2492,6 +2507,8 @@ def main():
                     "DD 驗收案例 column; 2.2.5-ds.5: usage.json from agy_usage.py --out (WARN without it)")
     ap.add_argument("--usage", metavar="FILE", help="2.2.5-ds.5: with --final, the agy_usage.py --out file "
                     "(default DIRECTOR/usage.json)")
+    ap.add_argument("--allow-incomplete-e2e", action="store_true",
+                    help="legacy diagnostic mode: warn instead of failing when E2E records lack explicit completion status")
     ap.add_argument("--feasibility", nargs="+", default=[], metavar="RECORD", help="2.3.0: the feasibility record a fix "
                     "set or a frozen gate needs (FEASIBLE_COUNT, SCRIPT, RESULT; each threshold with a real-world source "
                     "or marked reference)")
@@ -2588,8 +2605,10 @@ def main():
     if a.final:  # 2.2.5 (B5); 2.2.5-ds.5 (WO-DS-009 B2): plus the usage.json lines, never a failure
         if not pathlib.Path(a.final).is_dir():
             ap.error(f"--final: folder not found: {a.final}")
+        if a.candidate and not re.fullmatch(r"[0-9a-fA-F]{40}", a.candidate):
+            ap.error(f"--candidate takes the full commit, 40 hex digits (git rev-parse <branch>), got: {a.candidate}")
         notes = []
-        problems = final_problems(a.final, notes)
+        problems = final_problems(a.final, notes, allow_incomplete_e2e=a.allow_incomplete_e2e, candidate=a.candidate)
         late_failed += bool(problems) and not a.warn
         print(f"{('WARN' if a.warn else 'FAIL') if problems else 'OK  '} final {a.final}")
         for line in [f"  - {p}" for p in problems] + [f"  ~ {n}" for n in notes] + usage_lines(a.final, a.usage):
@@ -2624,8 +2643,8 @@ def main():
         ap.error("--dispatch-log works with --match, --preflight, --brief or --sequence")
     if a.dispatch_log and not pathlib.Path(a.dispatch_log).is_file():
         ap.error(f"--dispatch-log: file not found: {a.dispatch_log}")
-    if a.candidate and not (a.match or a.verdict or a.po_acceptance):
-        ap.error("--candidate works with --match, --verdict or --po-acceptance")
+    if a.candidate and not (a.match or a.verdict or a.po_acceptance or a.final):
+        ap.error("--candidate works with --match, --verdict, --po-acceptance or --final")
     if a.candidate and not re.fullmatch(r"[0-9a-fA-F]{40}", a.candidate):
         ap.error(f"--candidate takes the full commit, 40 hex digits (git rev-parse <branch>), got: {a.candidate}")
     candidate = a.candidate.lower() if a.candidate else None

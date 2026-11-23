@@ -453,6 +453,35 @@ def _stop_already_blocked(state_dir, conv_id, fp):
     return False
 
 
+def _git_common_dir(path):
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            p = pathlib.Path(proc.stdout.strip())
+            return p.resolve() if p.is_absolute() else (pathlib.Path(path) / p).resolve()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def resolve_stop_repo(cli_repo, payload):
+    """Prefer event workspace/cwd when it is verified under the same Git repo (handles linked worktrees cleanly)."""
+    ev_ws = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
+    ev_repo = payload.get("cwd") or (ev_ws[0] if ev_ws and isinstance(ev_ws[0], str) else None)
+    if ev_repo and pathlib.Path(ev_repo).is_dir():
+        if cli_repo and pathlib.Path(cli_repo).is_dir():
+            cli_cd = _git_common_dir(cli_repo)
+            ev_cd = _git_common_dir(ev_repo)
+            if cli_cd is None or (ev_cd is not None and os.path.normcase(ev_cd.as_posix()) == os.path.normcase(cli_cd.as_posix())):
+                return ev_repo
+            return cli_repo
+        return ev_repo
+    return cli_repo or "."
+
+
 def cmd_stop_check(args):
     """Handle Antigravity Stop hook: prevent stopping without updating RESUME_STATE (anti-loop safe)."""
     payload = read_stdin_json()
@@ -464,7 +493,7 @@ def cmd_stop_check(args):
         return 0
 
     resume_path = pathlib.Path(args.resume)
-    repo = args.repo or payload.get("cwd") or ((payload.get("workspacePaths") or [None])[0]) or "."
+    repo = resolve_stop_repo(args.repo, payload)
     conv_id = payload.get("conversationId")
     # Validate RESUME_STATE header if file exists
     if resume_path.is_file():

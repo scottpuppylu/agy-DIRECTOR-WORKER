@@ -282,9 +282,12 @@ def check_director(dpath, repo_path=None):
                 cfg_own = None
             if isinstance(cfg_own, dict):
                 cfg_cd = cfg_own.get("project_git_common_dir")
-                if isinstance(cfg_cd, str) and cfg_cd.strip() and repo_cd:
-                    if _norm_key(cfg_cd.strip()) != _norm_key(repo_cd):
-                        problems.append(f"director_work.json project_git_common_dir ({cfg_cd}) does not match --repo {rp.as_posix()}")
+                if repo_cd:
+                    if isinstance(cfg_cd, str) and cfg_cd.strip():
+                        if _norm_key(cfg_cd.strip()) != _norm_key(repo_cd):
+                            problems.append(f"director_work.json project_git_common_dir ({cfg_cd}) does not match --repo {rp.as_posix()}")
+                    else:
+                        shadows.append("director_work.json missing project_git_common_dir (legacy binding; re-run agy_setup.py --apply to migrate)")
                 cfg_wt = cfg_own.get("director_worktree")
                 if isinstance(cfg_wt, str) and cfg_wt.strip():
                     wt_cd = _git_common_dir(cfg_wt.strip()) if pathlib.Path(cfg_wt.strip()).is_dir() else None
@@ -298,8 +301,24 @@ def check_director(dpath, repo_path=None):
         else:
             try:
                 hdata = json.loads(hooks_fp.read_text(encoding="utf-8-sig"))
-                h_probs, _ = validate_hooks_structure(hdata)
+                h_probs, pre_cmd = validate_hooks_structure(hdata)
                 problems.extend(h_probs)
+                setup_state_fp = d / ".agydw_setup_state.json"
+                if not h_probs and setup_state_fp.is_file() and pre_cmd:
+                    try:
+                        sstate = json.loads(setup_state_fp.read_text(encoding="utf-8-sig"))
+                    except (OSError, ValueError):
+                        sstate = None
+                    if isinstance(sstate, dict):
+                        want_mode = sstate.get("guard_mode")
+                        if want_mode and f"--mode {want_mode}" not in pre_cmd:
+                            problems.append(f".agents/hooks.json guard mode drifted from {setup_state_fp.name} (expected --mode {want_mode})")
+                        if sstate.get("audit_log") and str(sstate["audit_log"]) not in pre_cmd:
+                            problems.append(f".agents/hooks.json audit log drifted from {setup_state_fp.name} ({sstate['audit_log']})")
+                        if sstate.get("enforce_resume"):
+                            stop_cmds, _ = _extract_hook_entries((hdata.get("agydw-audit-and-bridge") or {}).get("Stop"), need_matcher=False)
+                            if not any("--enforce-resume" in c for c in stop_cmds):
+                                problems.append(f".agents/hooks.json Stop hook missing --enforce-resume expected by {setup_state_fp.name}")
             except (OSError, ValueError) as exc:
                 problems.append(f".agents/hooks.json invalid JSON: {exc}")
 

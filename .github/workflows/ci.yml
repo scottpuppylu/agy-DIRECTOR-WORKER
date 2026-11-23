@@ -21,3 +21,30 @@ jobs:
         run: python -B -I -X utf8 tools/selftest_agy.py --verbose
       - name: Run agy_doctor against plugin and seatbelt hook
         run: python -B -I -X utf8 tools/agy_doctor.py --plugin plugin/director-work --probe-hooks --json
+      - name: Run full suite on Ubuntu without python alias (python3 only)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          PY3_BIN="$(command -v python3)"
+          NO_PY_DIR="$RUNNER_TEMP/py3only_bin"
+          rm -rf "$NO_PY_DIR"
+          mkdir -p "$NO_PY_DIR"
+          for dir in /usr/local/bin /usr/bin /bin; do
+            [ -d "$dir" ] || continue
+            for f in "$dir"/*; do
+              [ -x "$f" ] || continue
+              base="$(basename "$f")"
+              case "$base" in
+                python|python2*) continue ;;
+                *) [ -e "$NO_PY_DIR/$base" ] || ln -s "$f" "$NO_PY_DIR/$base" ;;
+              esac
+            done
+          done
+          ln -sf "$(readlink -f "$PY3_BIN")" "$NO_PY_DIR/python3"
+          export PATH="$NO_PY_DIR"
+          if command -v python >/dev/null 2>&1; then
+            echo "ERROR: python alias unexpectedly visible on PATH" >&2
+            exit 1
+          fi
+          python3 -B -I -X utf8 tools/selftest_agy.py --verbose
+          python3 -B -I -X utf8 tools/agy_doctor.py --plugin plugin/director-work --probe-hooks --json
