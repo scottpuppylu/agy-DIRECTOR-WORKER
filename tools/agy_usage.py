@@ -73,6 +73,23 @@ def _norm_ws_path(val):
     return s.rstrip("/") or "/"
 
 
+def _ws_path_variants(val):
+    """Return lowercase normalized path variants (raw + resolved when absolute) for 8.3/symlink safety."""
+    nv = _norm_ws_path(val)
+    if not nv:
+        return []
+    out = [nv.lower()]
+    try:
+        p = pathlib.Path(val.strip())
+        if p.is_absolute():
+            rv = _norm_ws_path(str(p.resolve()))
+            if rv and rv.lower() not in out:
+                out.append(rv.lower())
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return out
+
+
 def extract_structured_workspaces(steps):
     """Extract normalized workspace/cwd paths from structured metadata fields on transcript steps."""
     out = []
@@ -80,11 +97,10 @@ def extract_structured_workspaces(steps):
 
     def add_val(v):
         if isinstance(v, str):
-            nv = _norm_ws_path(v)
-            low = nv.lower() if nv else None
-            if low and low not in seen:
-                seen.add(low)
-                out.append(low)
+            for low in _ws_path_variants(v):
+                if low and low not in seen:
+                    seen.add(low)
+                    out.append(low)
         elif isinstance(v, list):
             for item in v:
                 add_val(item)
@@ -300,7 +316,11 @@ def main(argv=None):
 
     agy_audit = load_sibling("agy_audit")
     sources = agy_audit.discover_transcripts(a.transcript, a.conversation, a.brain_root, a.include_subagents)
-    proj_norms = [str(pathlib.Path(p).resolve()).replace("\\", "/").lower() for p in a.project_dir]
+    proj_norms = []
+    for p in a.project_dir:
+        for cand in _ws_path_variants(p) or [str(pathlib.Path(p).resolve()).replace("\\", "/").lower()]:
+            if cand not in proj_norms:
+                proj_norms.append(cand)
     proj_patterns = compile_project_patterns(proj_norms)
 
     rows = []
