@@ -248,11 +248,13 @@ def emit_antigravity(decision, reason=None, overwrite=None):
     return 0
 
 
-def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, conv_id):
+def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, conv_id, agent_hint=None):
     """Evaluate one translated call using hook_guard rules + Antigravity extras."""
     profile = a.profile
     if sessions is not None:
         profile = hg.session_profile(sessions, canonical, profile)
+    if agent_hint and agent_hint.strip().lower() in ("dw-worker", "dw-blind-reviewer", "dw-visual-qa"):
+        profile = "worker"
 
     if (canonical.get("tool_name") in ("Bash", "Monitor") and isinstance(canonical.get("tool_input"), dict)
             and isinstance(canonical["tool_input"].get("command"), str)):
@@ -273,6 +275,20 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
     file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     cwd = eval_call.get("cwd") if isinstance(eval_call.get("cwd"), str) else None
+
+    sess_why = None
+    if a.sessions and hg.base_profile(profile) != "director":
+        sess_canon = hg.canonical(a.sessions)
+        if eval_call.get("tool_name") in ("Write", "Edit") and isinstance(file_path, str) and file_path:
+            if hg.canonical(file_path, cwd) == sess_canon:
+                sess_why = "sessions role map is managed by the Director/setup (docs/08); report BLOCKED instead"
+        elif eval_call.get("tool_name") in hg.SHELL_TOOLS and isinstance(command, str):
+            shell = "powershell" if eval_call.get("tool_name") == "PowerShell" else "bash"
+            s_glob = hg.rule_path(a.sessions, None)
+            home_rp = hg.rule_path(str(pathlib.Path.home()), None)
+            cmds = list(hg.simple_commands(hg.FD_DUP.sub(" ", command), shell))
+            if hg.shell_write_match({"globs": [s_glob], "except": []}, cmds, hg.redirect_targets(command, shell), cwd, home_rp, command):
+                sess_why = "sessions role map is managed by the Director/setup (docs/08); report BLOCKED instead"
 
     if a.protect and hg.base_profile(profile) != "director" and eval_call.get("tool_name") in ("Write", "Edit") and isinstance(file_path, str) and file_path:
         why = hg.protected_reason(file_path, cwd, a.protect)
@@ -305,9 +321,9 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
             print(msg, file=sys.stderr)
             return 2
 
-    if a.protect and hg.base_profile(profile) != "director" and why and eval_call.get("tool_name") in ("Write", "Edit"):
-        # Protecting DIRECTOR/orders and DIRECTOR_LOG.md from non-director writes is always hard-denied
-        msg = f"BLOCKED by agy_guard [protect]: {why}"
+    if sess_why or (a.protect and hg.base_profile(profile) != "director" and why and eval_call.get("tool_name") in ("Write", "Edit")):
+        # Protecting DIRECTOR/orders, DIRECTOR_LOG.md, and .sessions.json from non-director writes is always hard-denied
+        msg = f"BLOCKED by agy_guard [protect]: {sess_why or why}"
         hg.audit(a.audit, canonical, "deny", "protect")
         if fmt == "antigravity":
             return emit_antigravity("deny", msg)
@@ -422,6 +438,7 @@ def main(argv=None):
         return emit_antigravity("allow") if a.format == "antigravity" else 0
 
     fmt = detect_format(payload, a.format)
+    agent_hint = payload.get("agentName") or payload.get("subagentName")
     if fmt == "antigravity":
         canonical, raw_name, raw_args = translate_antigravity_call(payload, a.shell)
         conv_id = canonical.get("session_id")
@@ -431,7 +448,7 @@ def main(argv=None):
         raw_args = canonical.get("tool_input") if isinstance(canonical.get("tool_input"), dict) else {}
         conv_id = canonical.get("session_id")
 
-    return evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, conv_id)
+    return evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, conv_id, agent_hint=agent_hint)
 
 
 if __name__ == "__main__":

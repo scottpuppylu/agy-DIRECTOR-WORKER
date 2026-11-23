@@ -53,21 +53,52 @@ def to_local_iso(dt):
     return dt.astimezone().isoformat(timespec="seconds")
 
 
-def matches_project(steps, project_norm_list):
-    """True if any USER_INPUT or tool call args inside steps references one of project_norm_list."""
-    if not project_norm_list:
+def compile_project_patterns(project_norm_list):
+    """Compile boundary-safe path regexes so '/tmp/app' never matches '/tmp/app-long'."""
+    patterns = []
+    for raw in project_norm_list or []:
+        p = raw.rstrip("/")
+        if not p:
+            continue
+        patterns.append(re.compile(rf"(?<![a-z0-9._:/-]){re.escape(p)}(?=$|[/\\\"'\s,;:)\]}}])"))
+    return patterns
+
+
+def matches_project(steps, project_patterns):
+    """True if any USER_INPUT or tool call args inside steps references one of project_patterns."""
+    if not project_patterns:
         return True
     for st in steps:
         stype = st.get("type")
         if stype == "USER_INPUT":
             txt = (st.get("content") or "").replace("\\", "/").lower()
-            if any(p in txt for p in project_norm_list):
+            if any(rx.search(txt) for rx in project_patterns):
                 return True
         elif stype == "PLANNER_RESPONSE":
             txt = json.dumps(st.get("tool_calls") or [], ensure_ascii=False).replace("\\", "/").lower()
-            if any(p in txt for p in project_norm_list):
+            if any(rx.search(txt) for rx in project_patterns):
                 return True
     return False
+
+
+def safe_int_metric(val, invalid_counts, field_name):
+    """Parse non-negative integer token counters safely, counting malformed values without crashing."""
+    if val is None:
+        return 0
+    if isinstance(val, bool):
+        invalid_counts[field_name] += 1
+        return 0
+    if isinstance(val, int):
+        if val >= 0:
+            return val
+        invalid_counts[field_name] += 1
+        return 0
+    if isinstance(val, str):
+        s = val.strip()
+        if re.fullmatch(r"\d+", s):
+            return int(s)
+    invalid_counts[field_name] += 1
+    return 0
 
 
 def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
@@ -85,6 +116,7 @@ def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
     turns = 0
     checkpoints = 0
     last_model = None
+    invalid_counts = collections.Counter()
 
     for st in steps:
         dt = agy_audit.parse_iso(st.get("created_at"))
@@ -102,9 +134,9 @@ def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
             if isinstance(m, str) and m:
                 models[m] += 1
                 last_model = m
-            in_t = int(st.get("input_tokens") or 0)
-            ca_t = int(st.get("cache_read_tokens") or 0)
-            out_t = int(st.get("output_tokens") or 0)
+            in_t = safe_int_metric(st.get("input_tokens"), invalid_counts, "input_tokens")
+            ca_t = safe_int_metric(st.get("cache_read_tokens"), invalid_counts, "cache_read_tokens")
+            out_t = safe_int_metric(st.get("output_tokens"), invalid_counts, "output_tokens")
             uncached_in += in_t
             cache_read += ca_t
             output_tok += out_t
@@ -144,6 +176,7 @@ def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
         "cache_hit_pct": cache_pct,
         "tool_calls": sum(tool_counts.values()),
         "tools": dict(tool_counts),
+        "invalid_metric_fields": dict(invalid_counts),
         "_steps": steps,
         "_started_dt": started_dt,
     }
@@ -198,6 +231,7 @@ def main(argv=None):
     agy_audit = load_sibling("agy_audit")
     sources = agy_audit.discover_transcripts(a.transcript, a.conversation, a.brain_root, a.include_subagents)
     proj_norms = [str(pathlib.Path(p).resolve()).replace("\\", "/").lower() for p in a.project_dir]
+    proj_patterns = compile_project_patterns(proj_norms)
 
     rows = []
     seen_cids = set()
@@ -208,10 +242,10 @@ def main(argv=None):
             row = summarize_conversation(cid, tp, parent_cid, agy_audit)
         except OSError:
             continue
-        if a.project_dir and not parent_cid and not matches_project(row["_steps"], proj_norms):
+        if a.project_dir and not parent_cid and not matches_project(row["_steps"], proj_patterns):
             continue
         # If parent matched project, its discovered child subagents are kept; if standalone subagent filter:
-        if a.project_dir and parent_cid and parent_cid not in seen_cids and not matches_project(row["_steps"], proj_norms):
+        if a.project_dir and parent_cid and parent_cid not in seen_cids and not matches_project(row["_steps"], proj_patterns):
             continue
         sdate = row["started_date"]
         if a.since and sdate != "UNKNOWN" and sdate < a.since:
@@ -250,7 +284,8 @@ def main(argv=None):
     daily = collections.defaultdict(lambda: {"sessions": 0, "turns": 0, "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0})
     model_mix = collections.Counter()
     totals = {"sessions": len(rows), "turns": 0, "steps": 0, "checkpoints": 0, "input_tokens": 0,
-              "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0, "tool_calls": 0}
+              "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0, "tool_calls": 0,
+              "invalid_metric_fields_total": 0}
     for r in rows:
         d = daily[r["started_date"]]
         d["sessions"] += 1
@@ -258,6 +293,7 @@ def main(argv=None):
             d[k] += r[k]
         for k in ("turns", "steps", "checkpoints", "input_tokens", "cache_read_tokens", "output_tokens", "total_tokens", "tool_calls"):
             totals[k] += r[k]
+        totals["invalid_metric_fields_total"] += sum((r.get("invalid_metric_fields") or {}).values())
         for m, cnt in r["models"].items():
             model_mix[m] += cnt
 
@@ -304,7 +340,10 @@ def main(argv=None):
     for day, d in sorted(daily.items()):
         print(f"  {day}  sessions={d['sessions']} turns={d['turns']} in={d['input_tokens']} cache={d['cache_read_tokens']} out={d['output_tokens']} total={d['total_tokens']}")
     print(f"\nTOTALS: sessions={totals['sessions']} turns={totals['turns']} checkpoints={totals['checkpoints']} "
-          f"in={totals['input_tokens']} cache={totals['cache_read_tokens']} out={totals['output_tokens']} total={totals['total_tokens']}")
+          f"in={totals['input_tokens']} cache={totals['cache_read_tokens']} out={totals['output_tokens']} total={totals['total_tokens']}"
+          + (f" invalid_fields={totals['invalid_metric_fields_total']}" if totals["invalid_metric_fields_total"] else ""))
+    if totals["invalid_metric_fields_total"]:
+        print(f"WARN: ignored {totals['invalid_metric_fields_total']} non-numeric token metric field(s) across transcript(s)")
     if loops_summary:
         counts_txt = " ".join(f"{k}={v}" for k, v in (loops_summary.get("counts") or {}).items() if v) or "none"
         print(f"LOOPS: findings={loops_summary.get('findings_total', 0)} ({counts_txt}) events={loops_summary.get('events', 0)}")

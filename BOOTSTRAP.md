@@ -78,19 +78,23 @@
 
 ## 3. 建立 `DIRECTOR/` 與專案 `.agents/` 護欄（標準機械建置）
 
-建議直接執行 `agy_setup.py` 完成標準骨架，減少手動複製出錯：
+建議直接執行 `agy_setup.py` 完成兩步驟中的「第 1 步：骨架建置」，減少手動複製出錯：
 
 ```text
-python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --director <WS>/DIRECTOR --rules <RULES> --guard-mode remind --init-director --apply
+python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --rules <RULES> --guard-mode remind --init-director --apply
 ```
 
-這一步會產生：
-- `<REPO>/.git/info/exclude` 排除本機設定（`AGENTS.local.md`、`.agents/hooks.local.json`、`_work/`）。
-- `<REPO>/.agents/plugins.json` 指向 `<RULES>/plugin`。
-- `<REPO>/.agents/hooks.json` 設定好 `PreToolUse`（`agy_guard.py`）、`PostToolUse`（`agy_audit.py hook-append` + `agy_hook_bridge.py post-tool`）、`SessionStart`、`PreInvocation` 與 `Stop`。
-- `<WS>/DIRECTOR/` 完整資料夾：`DIRECTOR_OPERATING_RULES.md`、`DIRECTOR_STATE.md`、`ACTIVE_WORKSTREAMS.md`、`DECISION_REGISTER.md`、`RISK_REGISTER.md`、`DIRECTOR_LOG.md`、`RESUME_STATE.md`、`PO_PENDING.md`、`GUARDS.md`、`BASELINE_METRICS.md`、`director_work.json`、`orders/`、`reviews/`、`research/`、`evidence/`、`audit/`，以及複製好的 `tools/`。
+這一步會先完成原子預檢（確認專案歸屬與既有 `.agents/` JSON 格式無誤後才寫入）：
+- 更新 Git common dir 的 `info/exclude`（主工作樹與 linked worktree 皆有效），排除本機產物（`AGENTS.local.md`、`.agents/hooks.local.json`、`_work/`）。
+- 預設為每個專案建立獨立的 `<WS>/DIRECTOR-<repo>/`（同時偵測並升級相匹配的舊版 `DIRECTOR/`，不同專案絕不混用），寫入含版本雜湊的 `tools/`（升級時自動備份舊版），以及 `.sessions.json`（預設 `default: "worker"`，並自動透過 `--protect` 保護 `orders/`、`DIRECTOR_LOG.md` 與 `.sessions.json`）。
+- 非破壞性合併 `<REPO>/.agents/plugins.json`（原地替換舊版 `director-work` 路徑並保留其他外掛）與 `<REPO>/.agents/hooks.json`。
 
-若你正在對標準模式要求**強烈擋下違規指令與保護工單**，可在與 PO 確認後把 `--guard-mode` 設為 `ask` 或加上 `--protect <WS>/DIRECTOR`。
+接著進行「第 2 步：註冊總監會話與填寫狀態」：
+- 將總監對話 ID 註冊進 `.sessions.json`（未註冊與 worker 會話一律保持受限，只有註冊後的總監可寫 `DIRECTOR_LOG.md` 與 `orders/`）：
+  ```text
+  python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --director <DIRECTOR> --register-director <CONVERSATION_ID> --apply
+  ```
+- 若要對高風險動作強制詢問，可於 `--guard-mode` 指定 `ask`（預設 `--protect` 與 `--sessions` 已自動開啟）。填完 `RESUME_STATE.md` 與待決項後再跑 `agy_setup_check.py --strict <DIRECTOR> --repo <REPO>`。
 
 ---
 
@@ -193,7 +197,7 @@ Antigravity 的全域開關位於使用者設定目錄（`~/.gemini/config/confi
 ## 13. 第一份回報給 PO
 
 回報前必須實跑並確認通過：
-1. `python -B -I -X utf8 <RULES>/tools/agy_setup_check.py --strict <WS>/DIRECTOR` -> `exit 0`
+1. `python -B -I -X utf8 <RULES>/tools/agy_setup_check.py --strict <DIRECTOR> --repo <REPO>` -> `exit 0`
 2. `python -B -I -X utf8 <RULES>/tools/agy_doctor.py --repo <REPO> --plugin <RULES>/plugin/director-work --probe-hooks` -> `exit 0`
 
 接著用繁體中文給 PO 簡潔結論（約 20 行）：

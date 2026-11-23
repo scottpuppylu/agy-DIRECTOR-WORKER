@@ -1,6 +1,6 @@
 # ANTIGRAVITY-PORT — `DIRECTOR-WORK v2.6.0` 到 Antigravity 的設計對照與實證紀錄
 
-本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.2`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的原生平台能力轉化為實質治理優勢。
+本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.3`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的原生平台能力轉化為實質治理優勢。
 
 ---
 
@@ -36,7 +36,7 @@
    - 對話紀錄位於 `<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`（必要時對應完整欄位檔 `transcript_full.jsonl`）。
    - 經實測 `PLANNER_RESPONSE` 的 token 欄位語意為：`input_tokens` = 未快取輸入 token；`cache_read_tokens` = Prompt Cache 命中 token；`output_tokens` = 輸出（含思考）token；因此**該回合實際總上下文大小 = `input_tokens + cache_read_tokens`**。
    - 工具呼叫的參數欄位在實際工具支援 `tool_calls[].args` 與 `tool_calls[].arguments` 兩種格式（含 JSON 編碼字串）；緊隨在後的 `GENERIC` 步驟記錄工具輸出。失敗的 `run_command` 在紀錄上 `status` 仍為 `"DONE"`，但 `content` 會包含 `Command exited with code N.`（`N != 0`）。壓縮事件會寫入 `type="CHECKPOINT"`。`invoke_subagent` 成功後回傳 JSON 含 `"conversationId": "<uuid>"`。
-   - `agy_audit.py` 與 `agy_hook_bridge.py` 採尾端分塊預篩與 `compaction_<cid>.json` 位元偏移量增量游標讀取，避免長對話在每次 Hook 重讀整份檔案；當 `hook-append` 無法看到工具輸出時一律記為 `status: "unverified"`，不假寫 `ok`。
+   - `agy_audit.py` 與 `agy_hook_bridge.py` 採最大 2 MiB 不重疊尾端分塊預篩與 `compaction_<cid>.json`（含檔頭雜湊與截短重設）增量游標讀取 `transcript.jsonl`；`RUNNING` 步驟保留 `status: "running"`，缺乏對應輸出時記 `status: "unverified"`，並優先依關聯 ID（`tool_call_id` / `call_id` / `id`）配對並行呼叫。
 4. **規則與外掛限制**：
    - 單一規則檔案硬上限 **24,000 bytes**；系統提示詞總預算為 20,000 tokens。本外掛 `plugin/director-work/rules/AGENTS.md` 控制在 ~4 KB（`< 8,500` B），且四份每輪必讀文件合計 `<= 9,550` B。
    - `plugin.json` 須嚴格符合官方 Schema（`https://antigravity.google/schemas/v1/plugin.json`：`repository` 為**字串 URL**，錯誤型別會導致載入失敗），`rules/AGENTS.md` 不帶 YAML frontmatter。
@@ -90,9 +90,9 @@
 
 - **Plugin 結構 (`plugin/director-work/`)**：
   - `plugin.json`：對齊官方 `https://antigravity.google/schemas/v1/plugin.json`（含字串 `repository` 與 `$schema`），附 3 條繁體中文建議啟動詞。
-  - `hooks.json` ＋ `scripts/seatbelt_hook.py`：外掛獨立複製時仍可開箱攔截憑證讀取與 `G00`/`G01`/`G02`，若存在 `DIRECTOR/tools/` 或 repo `tools/` 則委派完整 `agy_guard.py`。
+  - `hooks.json` ＋ `scripts/seatbelt_hook.py`：外掛獨立複製時仍可開箱攔截憑證讀取與 `G00`/`G01`/`G02`，透過 `python ... || python3 ...` 相容無 `python` 別名之 POSIX 環境；若存在 `DIRECTOR-<repo>/tools/`、`DIRECTOR/tools/` 或 repo `tools/` 則委派完整 `agy_guard.py`。
   - `skills/`（5 個按需技能）：`dw-bootstrap`、`dw-dispatch`、`dw-review-gate`、`dw-resume`、`dw-release`。
-  - `agents/`（3 個專屬子代理）：`dw-worker.md`（寫作施工）、`dw-blind-reviewer.md`（唯讀 `tools: [read_file]`）、`dw-visual-qa.md`（強調 `BROWSER_HOST_FACTS` 與跨畫面比較）。
+  - `agents/`（3 個專屬子代理）：`dw-worker.md`（寫作施工）、`dw-blind-reviewer.md`（鎖定 `tools: [read_file]`、`inheritMcp: false`、`inheritCustomizations: false`）、`dw-visual-qa.md`（強調 `BROWSER_HOST_FACTS` 與跨畫面比較）。
 - **Workflow Fan-Out 範本 (`templates/workflows/`)**：
   - `gate_verify_workflow.py`：用 Antigravity Python `run_workflow` 並聯驗證多個模組／AC 並彙總結構化 verdict JSON。
   - `parallel_spec_review_workflow.py`：分階段在派工前同時進行規格矛盾檢查、邊界壓力檢查與字面期望值手算覆核。

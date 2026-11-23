@@ -18,10 +18,10 @@
 python -B -I -X utf8 D:/path/to/agy-DIRECTOR-WORKER/tools/agy_setup.py --repo D:/path/to/your-project --init-director --apply
 ```
 
-這支腳本會一次做好三件事（全程不碰 `~/.gemini/config/config.json`）：
-1. 在 `<REPO>/.git/info/exclude` 排除本機產物（`AGENTS.local.md`、`.agents/hooks.local.json`、`_work/`）。
-2. 在 `<REPO>/.agents/plugins.json` 合併掛載 `agy-DIRECTOR-WORKER/plugin`，並在 `<REPO>/.agents/hooks.json` 合併寫入 `agydw-guard` 與 `agydw-audit-and-bridge`（保留既有設定，Windows `cmd /c` 與含空白路徑安全驗證過）。
-3. 在專案外建立 `<WS>/DIRECTOR/` 狀態資料夾與本機工具複本，然後跑一次 `agy_doctor.py` 與 `agy_setup_check.py --strict` 驗證。
+這支腳本會先通過原子預檢再一次做好三件事（全程不碰 `~/.gemini/config/config.json`）：
+1. 在 Git common dir 的 `info/exclude`（含 linked worktree）排除本機產物（`AGENTS.local.md`、`.agents/hooks.local.json`、`_work/`）。
+2. 在 `<REPO>/.agents/plugins.json` 合併或原地升級 `director-work` 路徑，並在 `<REPO>/.agents/hooks.json` 合併寫入含 `--protect` 與 `--sessions` 角色綁定的 `agydw-guard` 與 `agydw-audit-and-bridge`。
+3. 在專案外建立獨立的 `<WS>/DIRECTOR-<repo>/` 狀態資料夾（綁定 Git common-dir 歸屬防混用，升級時自動驗證並備份舊版 `tools/`）；填妥 `RESUME_STATE.md` 並用 `--register-director <CID>` 登記總監會話後，跑一次 `agy_doctor.py` 與 `agy_setup_check.py --strict --repo <REPO>` 驗證。
 
 掛載後，在 Antigravity 開新對話直接點選外掛建議指令或輸入：
 - `請啟動總監制 bootstrap：幫這個專案選擇一般模式或小白模式並建立 DIRECTOR/ 狀態`
@@ -88,7 +88,7 @@ AI agent 是**「會自己打開檔案、改程式、跑測試與檢查結果的
 | **Antigravity (AGY)** | Google 的 AI agent 開發平台（桌面 App / IDE / CLI） | 一間配有多名專業助理與檢查員的工程工作室 |
 | **總監（Coordinator）** | 你的主對話視窗，負責對接 PO、拆工單、驗收成果 | 工地主任／專案經理 |
 | **Worker（子代理 / Swarm）** | 總監用 `invoke_subagent` 或 `swarm` 開出來的助手 | 領工單進小房間專心施工的工程師 |
-| **盲審（dw-blind-reviewer）** | YAML 只授權 `read_file` 的純唯讀審查員，看不到也不改程式碼現場以外的流程 | 獨立稽核員（只看檔案與帳本，沒有權限改任何東西） |
+| **盲審（dw-blind-reviewer）** | YAML 鎖定 `tools: [read_file]` 且關閉 `inheritMcp: false` 與 `inheritCustomizations: false` 的純唯讀審查員 | 獨立稽核員（拿不到寫檔／shell 工具或可寫 MCP，只依總監交付路徑審查） |
 | **workspace="branch"** | Antigravity 原生建立隔離的 Git worktree 給子代理各自施工 | 每位工程師在獨立資料夾與草稿分支施工（底層共用 Git 物件庫） |
 | **PreToolUse / Hook** | 工具執行前／後自動觸發的檢查腳本（`.agents/hooks.json`） | 門口的安全門禁＋作業過程自動攝影紀錄 |
 | **OS 原生沙箱** | Windows AppContainer / macOS `sandbox-exec` / Linux namespaces | 系統層的防護牆：工坊外面的資料夾看得到但改不到 |
@@ -159,14 +159,16 @@ flowchart LR
 ## 常用指令速查（給總監與進階玩家）
 
 ```text
-# 1. 一鍵替專案安裝 agydw Hook、Plugin 參照與 DIRECTOR/ 骨架（保留既有 .agents 設定）
+# 1. 一鍵替專案安裝／升級 agydw（原子預檢＋每專案獨立 DIRECTOR-<repo>＋非破壞合併）
 python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --init-director --apply
+# （第 2 步：註冊總監對話 ID 到 .sessions.json，其餘未註冊／worker 會話一律保持受限）
+python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --register-director <CONVERSATION_ID> --apply
 
-# 2. 環境與外掛健康檢查（含官方 Plugin Schema 檢查與真實 Shell Hook 執行測試）
+# 2. 環境與外掛健康檢查（含官方 Plugin Schema 檢查、啟用與 matcher 檢核、真實 Shell Hook 執行測試）
 python -B -I -X utf8 <RULES>/tools/agy_doctor.py --repo <REPO> --plugin <RULES>/plugin/director-work --probe-hooks
 
-# 3. 檢查 DIRECTOR/ 與工作區 .agents/ 設定一致性
-python -B -I -X utf8 <RULES>/tools/agy_setup_check.py --strict <WS>/DIRECTOR --repo <REPO>
+# 3. 檢查 DIRECTOR/ 與工作區 .agents/ 設定一致性與專案歸屬
+python -B -I -X utf8 <RULES>/tools/agy_setup_check.py --strict <DIRECTOR> --repo <REPO>
 
 # 4. 鎖定測試檔案與核准 PLAN.md
 python -B -I -X utf8 <RULES>/tools/safety_gate.py --lock-tests tests/test_calc.py --repo <REPO>

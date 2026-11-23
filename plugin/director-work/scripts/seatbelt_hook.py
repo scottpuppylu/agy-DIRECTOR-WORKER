@@ -56,13 +56,15 @@ def parse_args_dict(tc):
 
 
 def find_full_guard(payload):
-    """Locate (agy_guard.py, guard_rules.json) if installed alongside workspace DIRECTOR/ or repo."""
+    """Locate (agy_guard.py, guard_rules.json) if installed alongside workspace DIRECTOR-<repo>/, DIRECTOR/, or repo."""
     candidates = []
     ws = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     roots = [r for r in (ws[0] if ws and isinstance(ws[0], str) else None, cwd) if r]
     for root in roots:
         p = pathlib.Path(root)
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", p.name).strip("-") or "project"
+        candidates.append(p.parent / f"DIRECTOR-{slug}" / "tools")
         candidates.append(p.parent / "DIRECTOR" / "tools")
         candidates.append(p / "DIRECTOR" / "tools")
     candidates.append(PLUGIN_DIR.parent.parent / "tools")
@@ -86,8 +88,8 @@ def emit_agy(decision, reason=None):
     return 0
 
 
-def fallback_eval(payload, raw_stdin, profile, mode):
-    is_agy = "toolCall" in payload or "hookEventName" in payload or "workspacePaths" in payload
+def fallback_eval(payload, raw_stdin, profile, mode, fmt="auto"):
+    is_agy = (fmt == "antigravity") or (fmt == "auto" and ("toolCall" in payload or "hookEventName" in payload or "workspacePaths" in payload))
     if is_agy:
         tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
         name = str(tc.get("name") or "")
@@ -154,6 +156,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profile", choices=("worker", "director", "cleaner"), default="worker")
     ap.add_argument("--mode", choices=("remind", "ask", "block"), default="remind")
+    ap.add_argument("--format", choices=("auto", "antigravity", "claude"), default="auto")
     a, extra = ap.parse_known_args(argv)
 
     raw_stdin = sys.stdin.read() if sys.stdin is not None else ""
@@ -167,7 +170,7 @@ def main(argv=None):
     guard_py, rules_json = find_full_guard(payload)
     if guard_py and rules_json:
         proc = subprocess.run(
-            [sys.executable, "-B", "-I", "-X", "utf8", str(guard_py), "--rules", str(rules_json), "--profile", a.profile, "--mode", a.mode] + extra,
+            [sys.executable, "-B", "-I", "-X", "utf8", str(guard_py), "--rules", str(rules_json), "--profile", a.profile, "--mode", a.mode, "--format", a.format] + extra,
             input=raw_stdin,
             text=True,
             encoding="utf-8",
@@ -181,7 +184,7 @@ def main(argv=None):
             sys.stderr.write(proc.stderr)
         return proc.returncode
 
-    return fallback_eval(payload, raw_stdin, a.profile, a.mode)
+    return fallback_eval(payload, raw_stdin, a.profile, a.mode, a.format)
 
 
 if __name__ == "__main__":

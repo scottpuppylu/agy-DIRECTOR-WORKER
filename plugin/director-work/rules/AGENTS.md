@@ -1,6 +1,6 @@
 # DIRECTOR-WORK（agydw 總監制核心規範）
 
-本外掛為 Google Antigravity 上的 `agy-DIRECTOR-WORKER`（`2.6.0-agy.1`）常駐核心規則。**專案既有的 `AGENTS.md` / `GEMINI.md` 與 PO 明確指示永遠優先於本規則。**
+本外掛為 Google Antigravity 上的 `agy-DIRECTOR-WORKER`（`2.6.0-agy.3`）常駐核心規則。**專案既有的 `AGENTS.md` / `GEMINI.md` 與 PO 明確指示永遠優先於本規則。**
 
 ## 1. 權責三層與 Single Writer
 

@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 
 TOOLS_DIR = pathlib.Path(__file__).resolve().parent
 ROOT_DIR = TOOLS_DIR.parent
@@ -775,8 +776,8 @@ NO MERGE / NO PUSH / NO FINAL ACCEPTANCE
 
         e2e_dir = director / "evidence" / "E2E"
         e2e_dir.mkdir(parents=True, exist_ok=True)
-        (e2e_dir / "e2e_sub.txt").write_text("ENTRY_POINT: src.demo.sub\nsub(5, 2) == 3\n", encoding="utf-8", newline="\n")
-        (director / "usage.json").write_text(json.dumps({"totals": {"total_tokens": 1000}}), encoding="utf-8", newline="\n")
+        (e2e_dir / "e2e_sub.txt").write_text("ENTRY_POINT: src.demo.sub\nEXIT_CODE: 0\nsub(5, 2) == 3\n", encoding="utf-8", newline="\n")
+        (director / "usage.json").write_text(json.dumps({"status": "OK", "totals": {"sessions": 1, "total_tokens": 1000}, "sessions": []}), encoding="utf-8", newline="\n")
         run_py(TOOLS_DIR / "gate_check.py", ["--final", str(director), "--usage", str(director / "usage.json")], check_zero=True)
 
         # memory_size_check --kind rules
@@ -831,6 +832,8 @@ def test_plugin_budgets_vocab_and_hygiene():
         assert not bad_found, f"unmapped hang-risk tool(s) in {agent_md.name}: {bad_found}"
         if agent_md.name == "dw-blind-reviewer.md":
             assert listed == ["read_file"], f"dw-blind-reviewer tools must be [read_file], got {listed}"
+            assert re.search(r"^inheritMcp:\s*false\b", m.group(1), re.M), "dw-blind-reviewer must set inheritMcp: false"
+            assert re.search(r"^inheritCustomizations:\s*false\b", m.group(1), re.M), "dw-blind-reviewer must set inheritCustomizations: false"
 
     # 3. Budgets
     rules_size = (ROOT_DIR / "plugin" / "director-work" / "rules" / "AGENTS.md").stat().st_size
@@ -1157,6 +1160,389 @@ def test_incremental_transcript_perf():
     return f"{size_mb}MB transcript: tail_find={t_find_b:.1f}+{t_find_a:.1f}ms, cp_init={t_cp1:.1f}ms, cp_inc={t_cp2:.2f}ms"
 
 
+def test_scope_candidate_cross_checkout():
+    with tempfile.TemporaryDirectory(prefix="agydw_scope_") as td:
+        tmp = pathlib.Path(td)
+        repo = tmp / "repo"
+        repo.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(repo)], check_zero=True)
+        run_cmd(["git", "-C", str(repo), "config", "user.name", "Demo"], check_zero=True)
+        run_cmd(["git", "-C", str(repo), "config", "user.email", "demo@example.invalid"], check_zero=True)
+        (repo / "hello.txt").write_text("hello\n", encoding="utf-8", newline="\n")
+        run_cmd(["git", "-C", str(repo), "add", "hello.txt"], check_zero=True)
+        run_cmd(["git", "-C", str(repo), "commit", "-m", "base"], check_zero=True)
+        base_sha = run_cmd(["git", "-C", str(repo), "rev-parse", "HEAD"], check_zero=True).stdout.strip()
+
+        run_cmd(["git", "-C", str(repo), "switch", "-c", "worker"], check_zero=True)
+        (repo / "hello.txt").write_text("updated\n", encoding="utf-8", newline="\n")
+        (repo / "another.txt").write_text("forbidden\n", encoding="utf-8", newline="\n")
+        run_cmd(["git", "-C", str(repo), "add", "-A"], check_zero=True)
+        run_cmd(["git", "-C", str(repo), "commit", "-m", "WO-101 change"], check_zero=True)
+        cand = run_cmd(["git", "-C", str(repo), "rev-parse", "HEAD"], check_zero=True).stdout.strip()
+
+        order = tmp / "WO-101.md"
+        order.write_text(
+            f"# WO-101\nBASE_REF = {base_sha}\nSCOPE:\n- hello.txt\nFORBIDDEN:\n- another.txt\nREQUIRED_CHANGES:\n- hello.txt\n",
+            encoding="utf-8", newline="\n",
+        )
+
+        p_worker = run_py(TOOLS_DIR / "scope_check.py", ["--order", str(order), "--repo", str(repo), "--candidate", cand])
+        assert p_worker.returncode == 1 and "FORBIDDEN another.txt" in p_worker.stdout, p_worker.stdout
+
+        run_cmd(["git", "-C", str(repo), "switch", "main"], check_zero=True)
+        p_main = run_py(TOOLS_DIR / "scope_check.py", ["--order", str(order), "--repo", str(repo), "--candidate", cand])
+        assert p_main.returncode == 1 and "FORBIDDEN another.txt" in p_main.stdout, f"clean main checkout missed candidate violation: {p_main.stdout}"
+        line_w = [ln for ln in p_worker.stdout.splitlines() if ln.startswith("SCOPE_CHECK:")][0]
+        line_m = [ln for ln in p_main.stdout.splitlines() if ln.startswith("SCOPE_CHECK:")][0]
+        assert line_w == line_m, f"verdict drift across checkouts: {line_w!r} != {line_m!r}"
+
+    return "scope_check --candidate identical VIOLATION on worker branch & clean main checkout"
+
+
+def test_audit_nonterminal_and_call_id_pairing():
+    with tempfile.TemporaryDirectory(prefix="agydw_aud_nt_") as td:
+        tmp = pathlib.Path(td)
+        now_str = datetime.datetime.now().astimezone().replace(microsecond=0).isoformat()
+        tr_run = tmp / "running.jsonl"
+        tr_run.write_text(
+            json.dumps({
+                "step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": now_str,
+                "tool_calls": [{"id": "c1", "name": "run_command", "args": {"CommandLine": "python -m unittest"}}],
+            }) + "\n" +
+            json.dumps({
+                "step_index": 1, "type": "GENERIC", "status": "RUNNING", "created_at": now_str,
+                "tool_call_id": "c1", "content": "Process still running",
+            }) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+
+        live_log = tmp / "live.jsonl"
+        run_py(TOOLS_DIR / "agy_audit.py", ["hook-append", "--log", str(live_log)], stdin_obj={
+            "conversationId": "conv-run", "stepIdx": 1, "transcriptPath": str(tr_run),
+            "toolCall": {"id": "c1", "name": "run_command", "args": {"CommandLine": "python -m unittest"}},
+        }, check_zero=True)
+        built = tmp / "built.jsonl"
+        run_py(TOOLS_DIR / "agy_audit.py", ["build", "--transcript", str(tr_run), "--out", str(built), "--json"], check_zero=True)
+
+        rep = tmp / "REP.md"
+        rep.write_text("# TASK REPORT\nSESSION_ID: conv-run\nRAN:\n", encoding="utf-8", newline="\n")
+        run_py(TOOLS_DIR / "ran_line.py", ["--to", str(rep), "--exit", "0", "--cmd", "python -m unittest"], check_zero=True)
+
+        for lf in (live_log, built):
+            rec = json.loads(lf.read_text("utf-8").splitlines()[-1])
+            assert rec["result"]["status"] == "running", f"RUNNING step became {rec['result']}"
+            ver = run_py(TOOLS_DIR / "agy_audit.py", ["verify", "--log", str(lf)], check_zero=True)
+            assert "running=1" in ver.stdout and "confirmed_ok=0" in ver.stdout, ver.stdout
+            rva = run_py(TOOLS_DIR / "report_vs_audit.py", ["--report", str(rep), "--log", str(lf), "--session", "conv-run"])
+            assert rva.returncode == 1, f"report_vs_audit must reject exit=0 over RUNNING log: {rva.stdout}"
+
+        # Call-ID correlation pairing (no FIFO misattribution on missing call-alpha)
+        pair_tr = tmp / "pair.jsonl"
+        pair_tr.write_text(
+            json.dumps({
+                "step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": now_str,
+                "tool_calls": [
+                    {"id": "call-alpha", "name": "run_command", "args": {"CommandLine": "python -m unittest tests.test_alpha"}},
+                    {"id": "call-beta", "name": "run_command", "args": {"CommandLine": "python -m unittest tests.test_beta"}},
+                ],
+            }) + "\n" +
+            json.dumps({
+                "step_index": 1, "type": "GENERIC", "status": "ERROR", "created_at": now_str,
+                "tool_call_id": "call-beta", "content": "Command exited with code 1.",
+            }) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        pair_out = tmp / "pair_audit.jsonl"
+        pb = run_py(TOOLS_DIR / "agy_audit.py", ["build", "--transcript", str(pair_tr), "--out", str(pair_out), "--json"], check_zero=True)
+        pj = json.loads(pb.stdout)
+        assert pj["no_result"] == 1 and pj["calls"] == 1, pj
+        prec = json.loads(pair_out.read_text("utf-8").splitlines()[-1])
+        assert "test_beta" in prec["input"] and "test_alpha" not in prec["input"], prec
+
+        # Strict subagent discovery: read_file reading JSON with conversationId MUST NOT attach unrelated session
+        brain = tmp / "brain"
+        parent_cid = "ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee"
+        other_cid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        p_tr = brain / parent_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        o_tr = brain / other_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        p_tr.parent.mkdir(parents=True)
+        o_tr.parent.mkdir(parents=True)
+        p_tr.write_text(
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "created_at": now_str, "content": f"Open {(tmp / 'proj').as_posix()}"}) + "\n" +
+            json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "created_at": now_str, "input_tokens": 10, "tool_calls": [{"name": "read_file", "args": {"Path": "metadata.json"}}]}) + "\n" +
+            json.dumps({"step_index": 2, "type": "GENERIC", "status": "DONE", "created_at": now_str, "content": json.dumps({"conversationId": other_cid})}) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        o_tr.write_text(
+            json.dumps({"step_index": 0, "type": "PLANNER_RESPONSE", "created_at": now_str, "input_tokens": 850, "tool_calls": [{"name": "run_command", "args": {"CommandLine": "git status"}}]}) + "\n" +
+            json.dumps({"step_index": 1, "type": "GENERIC", "status": "DONE", "created_at": now_str, "content": "Command exited with code 0."}) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        u = run_py(TOOLS_DIR / "agy_usage.py", ["--transcript", str(p_tr), "--include-subagents", "--brain-root", str(brain), "--json"], check_zero=True)
+        uj = json.loads(u.stdout)
+        assert uj["totals"]["sessions"] == 1 and uj["totals"]["total_tokens"] == 10, uj
+
+    return "RUNNING status, call_id pairing, and non-subagent read_file filtering OK"
+
+
+def test_sibling_repos_and_atomic_setup():
+    with tempfile.TemporaryDirectory(prefix="agydw_sib_") as td:
+        tmp = pathlib.Path(td)
+        fam = tmp / "family"
+        alpha = fam / "alpha"
+        beta = fam / "beta"
+        for r in (alpha, beta):
+            r.mkdir(parents=True)
+            run_cmd(["git", "init", "-b", "main", str(r)], check_zero=True)
+            run_cmd(["git", "-C", str(r), "config", "user.name", "Demo"], check_zero=True)
+            run_cmd(["git", "-C", str(r), "config", "user.email", "demo@example.invalid"], check_zero=True)
+            (r / "hello.txt").write_text("hi\n", encoding="utf-8", newline="\n")
+            run_cmd(["git", "-C", str(r), "add", "-A"], check_zero=True)
+            run_cmd(["git", "-C", str(r), "commit", "-m", "init"], check_zero=True)
+
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(alpha), "--init-director", "--apply"], check_zero=True)
+        dir_a = fam / "DIRECTOR-alpha"
+        assert (dir_a / "RESUME_STATE.md").is_file()
+        (dir_a / "RESUME_STATE.md").write_text("PROGRESS: ALPHA_ONLY\nDOING: a\nNEXT_STEP: b\nCOMMS: c\n\nUPDATED: 2026-11-24\n", encoding="utf-8", newline="\n")
+
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(beta), "--init-director", "--apply"], check_zero=True)
+        dir_b = fam / "DIRECTOR-beta"
+        assert (dir_b / "RESUME_STATE.md").is_file()
+        sess_b_cmd = json.loads((beta / ".agents" / "hooks.json").read_text("utf-8"))["agydw-audit-and-bridge"]["SessionStart"][0]["command"]
+        pb = run_hook_shell(sess_b_cmd, beta / ".agents", {"conversationId": "c-beta", "workspacePaths": [beta.as_posix()]})
+        assert pb.returncode == 0 and "ALPHA_ONLY" not in pb.stdout, pb.stdout
+
+        # Forcing beta onto alpha's DIRECTOR MUST fail pre-flight and setup_check
+        bad_own = run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(beta), "--director", str(dir_a), "--apply"])
+        assert bad_own.returncode == 1, bad_own.stdout
+        bad_chk = run_py(TOOLS_DIR / "agy_setup_check.py", ["--strict", str(dir_a), "--repo", str(beta)])
+        assert bad_chk.returncode == 1, bad_chk.stdout
+
+        # R03: Atomic pre-flight when secondary plugins.json is corrupt -> zero partial writes
+        broken = tmp / "partial" / "repo"
+        broken.mkdir(parents=True)
+        run_cmd(["git", "init", "-b", "main", str(broken)], check_zero=True)
+        (broken / ".agents").mkdir()
+        (broken / ".agents" / "plugins.json").write_text('{"entries":', encoding="utf-8", newline="\n")
+        fail_setup = run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(broken), "--init-director", "--apply"])
+        assert fail_setup.returncode == 1, fail_setup.stdout
+        assert not (tmp / "partial" / "DIRECTOR-repo").exists(), "DIRECTOR created despite failed pre-flight"
+        assert not (broken / ".agents" / "hooks.json").exists(), "hooks.json written despite failed pre-flight"
+        assert run_cmd(["git", "-C", str(broken), "check-ignore", "AGENTS.local.md"]).returncode == 1, "git exclude written despite failed pre-flight"
+
+        # R16: Running copied DIRECTOR-alpha/tools/agy_setup.py without --rules resolves rules root from manifest
+        gamma = tmp / "gamma"
+        gamma.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(gamma)], check_zero=True)
+        run_py(dir_a / "tools" / "agy_setup.py", ["--repo", str(gamma), "--init-director", "--apply"], check_zero=True)
+        assert (tmp / "DIRECTOR-gamma" / "RESUME_STATE.md").is_file() and (gamma / ".agents" / "plugins.json").is_file()
+
+        # R04: Linked git worktree shares parent DIRECTOR-alpha and updates common git info/exclude
+        wt = fam / "alpha-wt"
+        run_cmd(["git", "-C", str(alpha), "worktree", "add", "-b", "wt1", str(wt)], check_zero=True)
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(wt), "--apply"], check_zero=True)
+        assert run_cmd(["git", "-C", str(wt), "check-ignore", "_work/probe.txt"]).returncode == 0, "worktree _work/ not ignored via common exclude"
+        wt_guard_cmd = json.loads((wt / ".agents" / "hooks.json").read_text("utf-8"))["agydw-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+        assert "DIRECTOR-alpha" in wt_guard_cmd, wt_guard_cmd
+
+    return "per-project DIRECTOR-<repo>, ownership guard, atomic pre-flight, manifest rules resolve, worktree exclude OK"
+
+
+def test_session_role_binding_and_upgrade():
+    with tempfile.TemporaryDirectory(prefix="agydw_role_") as td:
+        tmp = pathlib.Path(td)
+        repo = tmp / "myproj"
+        repo.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(repo)], check_zero=True)
+
+        # --protect CLI compatibility check + default setup
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--protect", str(tmp / "DIRECTOR-myproj"), "--init-director", "--apply"], check_zero=True)
+        ddir = tmp / "DIRECTOR-myproj"
+        assert (ddir / ".sessions.json").is_file()
+
+        # Even if user sets fallback --profile director without registering worker, .sessions.json default='worker' blocks workers
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--profile", "director", "--apply"], check_zero=True)
+        guard_cmd = json.loads((repo / ".agents" / "hooks.json").read_text("utf-8"))["agydw-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+
+        def send_write(cid, path_target, agent_name=None):
+            pl = {
+                "hookEventName": "PreToolUse", "conversationId": cid, "workspacePaths": [repo.as_posix()],
+                "toolCall": {"name": "write_file", "args": {"Path": path_target.as_posix()}},
+            }
+            if agent_name:
+                pl["agentName"] = agent_name
+            proc = run_hook_shell(guard_cmd, repo / ".agents", pl)
+            assert proc.returncode == 0, proc.stderr
+            return json.loads(proc.stdout)["decision"]
+
+        assert send_write("unreg-worker", ddir / "DIRECTOR_LOG.md") == "deny"
+        assert send_write("unreg-worker", ddir / ".sessions.json") == "deny"
+
+        # Register director conversation ID -> director writes allowed, other worker sessions STILL denied
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--register-director", "dir-cid-1", "--apply"], check_zero=True)
+        assert send_write("dir-cid-1", ddir / "DIRECTOR_LOG.md") == "allow"
+        assert send_write("dir-cid-1", ddir / "DIRECTOR_LOG.md", agent_name="dw-worker") == "deny"
+        assert send_write("other-worker", ddir / "DIRECTOR_LOG.md") == "deny"
+
+        # Simulate stale v2.6.0-agy.1 tools copy + stale old plugin path (keeping user custom plugin)
+        copied_guard = ddir / "tools" / "agy_guard.py"
+        copied_guard.write_text(copied_guard.read_text("utf-8") + "\n# simulated v1 stale copy\n", encoding="utf-8", newline="\n")
+        (ddir / "tools" / "AGYDW_TOOLS_MANIFEST.json").unlink()
+        (repo / ".agents" / "plugins.json").write_text(json.dumps({
+            "entries": [{"path": (tmp / "other-plugin").as_posix()}, {"path": (tmp / "v260-agy1" / "plugin" / "director-work").as_posix()}]
+        }), encoding="utf-8", newline="\n")
+
+        up = run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--apply"], check_zero=True)
+        assert "UPGRADE tools/" in up.stdout and "UPGRADE " in up.stdout, up.stdout
+        assert copied_guard.read_bytes() == (TOOLS_DIR / "agy_guard.py").read_bytes(), "stale guard copy was not upgraded"
+        assert list(ddir.glob(".tools_backup_*")), "missing rollback tools backup directory"
+        plugs = json.loads((repo / ".agents" / "plugins.json").read_text("utf-8"))["entries"]
+        assert len(plugs) == 2 and plugs[0]["path"].endswith("other-plugin") and plugs[1]["path"].endswith("/plugin"), plugs
+
+    return "session-bound director/worker isolation, .sessions protection, stale tools & plugin upgrade OK"
+
+
+def test_doctor_disabled_matcher_and_final_e2e_gate():
+    with tempfile.TemporaryDirectory(prefix="agydw_doc_neg_") as td:
+        tmp = pathlib.Path(td)
+        repo = tmp / "proj"
+        director = tmp / "DIRECTOR-proj"
+        repo.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(repo)], check_zero=True)
+        run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--director", str(director), "--init-director", "--apply"], check_zero=True)
+        (director / "DIRECTOR_STATE.md").write_text(
+            f"# DIRECTOR_STATE\nPROJECT_REPO: {repo.as_posix()}\nPENDING_METHOD: ask_question + PO_PENDING.md\n",
+            encoding="utf-8", newline="\n",
+        )
+        (director / "RESUME_STATE.md").write_text(
+            "PROGRESS: ok\nDOING: test\nNEXT_STEP: verify\nCOMMS: NONE\n\nUPDATED: 2026-11-24\n",
+            encoding="utf-8", newline="\n",
+        )
+        base_hooks = json.loads((repo / ".agents" / "hooks.json").read_text("utf-8"))
+
+        for label, mutator in (
+            ("disabled_group", lambda d: d["agydw-guard"].__setitem__("enabled", False)),
+            ("bad_matcher", lambda d: d["agydw-guard"]["PreToolUse"][0].__setitem__("matcher", "unrelated_example_tool")),
+            ("missing_lifecycle", lambda d: d["agydw-audit-and-bridge"].pop("Stop")),
+        ):
+            mut = json.loads(json.dumps(base_hooks))
+            mutator(mut)
+            (repo / ".agents" / "hooks.json").write_text(json.dumps(mut), encoding="utf-8", newline="\n")
+            sc = run_py(TOOLS_DIR / "agy_setup_check.py", ["--strict", str(director), "--repo", str(repo)])
+            assert sc.returncode == 1, f"{label}: setup_check --strict should fail: {sc.stdout}"
+            doc = run_py(TOOLS_DIR / "agy_doctor.py", ["--repo", str(repo), "--plugin", str(ROOT_DIR / "plugin" / "director-work"), "--probe-hooks", "--json"])
+            dj = json.loads(doc.stdout)
+            statuses = {c["name"]: c["status"] for c in dj["checks"]}
+            assert doc.returncode == 1 and statuses.get("workspace_hook_exec") != "HOOK_EXEC_OK", f"{label}: false green doctor: {statuses}"
+
+        # R12: gate_check --final MUST fail on failed E2E and warn on empty {} usage.json
+        (director / "evidence" / "E2E").mkdir(parents=True, exist_ok=True)
+        (director / "evidence" / "E2E" / "run.txt").write_text(
+            "ENTRY_POINT: python -m unittest\nEXIT_CODE: 1\nFAILED (failures=1)\n", encoding="utf-8", newline="\n",
+        )
+        (director / "usage.json").write_text("{}", encoding="utf-8", newline="\n")
+        gf = run_py(TOOLS_DIR / "gate_check.py", ["--final", str(director), "--usage", str(director / "usage.json")])
+        assert gf.returncode == 1 and "WARN USAGE" in gf.stdout and "ok USAGE" not in gf.stdout, gf.stdout
+
+    return "disabled/broken-matcher/missing-lifecycle FAIL doctor + failed E2E & {} usage caught by gate_check"
+
+
+def test_stop_bridge_rotation_usage_and_worktree_posix():
+    with tempfile.TemporaryDirectory(prefix="agydw_r67_") as td:
+        tmp = pathlib.Path(td)
+        # 1. Stop check (model_stop + committed HEAD newer than RESUME + 1-shot anti-loop)
+        repo = tmp / "stop_repo"
+        repo.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(repo)], check_zero=True)
+        run_cmd(["git", "-C", str(repo), "config", "user.name", "Demo"], check_zero=True)
+        run_cmd(["git", "-C", str(repo), "config", "user.email", "demo@example.invalid"], check_zero=True)
+        (repo / "hello.txt").write_text("v1\n", encoding="utf-8", newline="\n")
+        run_cmd(["git", "-C", str(repo), "add", "-A"], check_zero=True)
+        run_cmd(["git", "-C", str(repo), "commit", "-m", "v1"], check_zero=True)
+
+        resume = tmp / "RESUME_STATE.md"
+        resume.write_text("PROGRESS: 0\nDOING: x\nNEXT_STEP: y\nCOMMS: z\n", encoding="utf-8", newline="\n")
+        os.utime(resume, (1000000000, 1000000000))
+        state = tmp / "state"
+        stop_pl = {"conversationId": "c-stop", "terminationReason": "model_stop", "fullyIdle": True, "workspacePaths": [repo.as_posix()]}
+        s1 = run_py(TOOLS_DIR / "agy_hook_bridge.py", ["stop-check", "--resume", str(resume), "--repo", str(repo), "--state-dir", str(state), "--enforce-resume"], stdin_obj=stop_pl, check_zero=True)
+        assert json.loads(s1.stdout)["decision"] == "continue", f"model_stop after newer commit must continue: {s1.stdout}"
+        # Same stale state on immediate next Stop -> allowed by 1-shot anti-loop
+        s2 = run_py(TOOLS_DIR / "agy_hook_bridge.py", ["stop-check", "--resume", str(resume), "--repo", str(repo), "--state-dir", str(state), "--enforce-resume"], stdin_obj=stop_pl, check_zero=True)
+        assert json.loads(s2.stdout)["decision"] == "allow", f"1-shot anti-loop should allow repeated stale stop: {s2.stdout}"
+
+        # 2. Checkpoint rotation/truncation re-injection (3 -> 1 CHECKPOINT at same path)
+        tr = tmp / "rot.jsonl"
+        tr.write_text("".join(json.dumps({"step_index": i, "type": "CHECKPOINT", "content": "pad" * 50}) + "\n" for i in range(3)), encoding="utf-8", newline="\n")
+        pl_rot = {"conversationId": "rot", "transcriptPath": str(tr)}
+        run_py(TOOLS_DIR / "agy_hook_bridge.py", ["session-start", "--state-dir", str(state), "--resume", str(resume)], stdin_obj=pl_rot, check_zero=True)
+        tr.write_text(json.dumps({"step_index": 0, "type": "CHECKPOINT", "content": "rotated"}) + "\n", encoding="utf-8", newline="\n")
+        pr = run_py(TOOLS_DIR / "agy_hook_bridge.py", ["pre-invocation", "--state-dir", str(state), "--resume", str(resume)], stdin_obj=pl_rot, check_zero=True)
+        assert "compaction detected" in json.dumps(json.loads(pr.stdout)), f"rotated checkpoint missed re-inject: {pr.stdout}"
+
+        # 3. agy_usage prefix boundary + non-numeric counter safety
+        u_dir = tmp / "usage"
+        u_dir.mkdir()
+        app = (u_dir / "app").resolve().as_posix()
+        app_long = (u_dir / "app-long").resolve().as_posix()
+        wrong_tr = u_dir / "wrong.jsonl"
+        wrong_tr.write_text(
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "content": f"Open {app_long}"}) + "\n" +
+            json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 321}) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        u_pref = run_py(TOOLS_DIR / "agy_usage.py", ["--transcript", str(wrong_tr), "--project-dir", app, "--json"])
+        assert u_pref.returncode == 2 and json.loads(u_pref.stdout)["status"] == "NO_DATA", u_pref.stdout
+
+        bad_cnt = u_dir / "bad_cnt.jsonl"
+        bad_cnt.write_text(json.dumps({"step_index": 0, "type": "PLANNER_RESPONSE", "input_tokens": "unknown"}) + "\n", encoding="utf-8", newline="\n")
+        u_bad = run_py(TOOLS_DIR / "agy_usage.py", ["--transcript", str(bad_cnt), "--json"], check_zero=True)
+        assert json.loads(u_bad.stdout)["totals"]["invalid_metric_fields_total"] == 1, u_bad.stdout
+
+        # 4. POSIX '$' path quoting + python3-only plugin hook fallback (on POSIX)
+        if os.name != "nt":
+            dollar_repo = tmp / "literal $agyfixture" / "repo"
+            dollar_repo.mkdir(parents=True)
+            run_cmd(["git", "init", "-b", "main", str(dollar_repo)], check_zero=True)
+            run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(dollar_repo), "--init-director", "--apply"], check_zero=True)
+            d_cmd = json.loads((dollar_repo / ".agents" / "hooks.json").read_text("utf-8"))["agydw-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+            dp = run_hook_shell(d_cmd, dollar_repo / ".agents", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}})
+            assert dp.returncode == 0 and json.loads(dp.stdout)["decision"] == "allow", f"$ path hook failed: {dp.stderr}"
+
+            # Test plugin/hooks.json with PATH containing python3 only (no python binary anywhere on PATH)
+            bin_only = tmp / "py3only"
+            bin_only.mkdir()
+            (bin_only / "python3").symlink_to(sys.executable)
+            plug_cmd = json.loads((ROOT_DIR / "plugin" / "director-work" / "hooks.json").read_text("utf-8"))["agydw-plugin-seatbelt"]["PreToolUse"][0]["hooks"][0]["command"]
+            env = dict(os.environ, PATH=bin_only.as_posix())
+            p3 = subprocess.run(
+                ["/bin/sh", "-c", plug_cmd],
+                cwd=str(ROOT_DIR / "plugin" / "director-work"),
+                input=json.dumps({"toolCall": {"name": "read_file", "args": {"Path": ".env"}}}),
+                text=True, encoding="utf-8", errors="replace", capture_output=True, env=env, timeout=20,
+            )
+            assert p3.returncode == 0 and json.loads(p3.stdout)["decision"] == "deny", f"python3 fallback failed: rc={p3.returncode} out={p3.stdout} err={p3.stderr}"
+
+        # 5. Bounded memory budget check on large 16 MiB missing-step lookup
+        import importlib.util
+        spec_a = importlib.util.spec_from_file_location("_test_aud_m", TOOLS_DIR / "agy_audit.py")
+        mod_a = importlib.util.module_from_spec(spec_a)
+        spec_a.loader.exec_module(mod_a)
+        big_tr = tmp / "big_missing.jsonl"
+        big_line = json.dumps({"step_index": 7, "type": "GENERIC", "content": "x" * 65430}).encode("utf-8") + b"\n"
+        with open(big_tr, "wb") as fh:
+            for _ in range(256):  # ~16 MiB
+                fh.write(big_line)
+        tracemalloc.start()
+        mod_a.find_step_in_transcript(str(big_tr), 99999999)
+        _, peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        peak_mib = peak_bytes / (1024 * 1024)
+        assert peak_mib < 12.0, f"tail lookup peak allocation too large: {peak_mib:.2f} MiB"
+
+    return f"stop/rotation/usage/posix-fallback + bounded tail scan ({peak_mib:.2f} MiB peak) OK"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--verbose", "-v", action="store_true", help="print every passing check")
@@ -1179,6 +1565,12 @@ def main(argv=None):
     r.check("incremental_transcript_perf", test_incremental_transcript_perf)
     r.check("governance_tools_roundtrip", test_governance_tools_roundtrip)
     r.check("plugin_budgets_vocab_and_hygiene", test_plugin_budgets_vocab_and_hygiene)
+    r.check("scope_candidate_cross_checkout", test_scope_candidate_cross_checkout)
+    r.check("audit_nonterminal_and_call_id_pairing", test_audit_nonterminal_and_call_id_pairing)
+    r.check("sibling_repos_and_atomic_setup", test_sibling_repos_and_atomic_setup)
+    r.check("session_role_binding_and_upgrade", test_session_role_binding_and_upgrade)
+    r.check("doctor_disabled_matcher_and_final_e2e_gate", test_doctor_disabled_matcher_and_final_e2e_gate)
+    r.check("stop_bridge_rotation_usage_and_worktree_posix", test_stop_bridge_rotation_usage_and_worktree_posix)
 
     print(f"SELFTEST_AGY_SUMMARY: pass={r.passed} skip={r.skipped} fail={r.failed}")
     return 1 if r.failed else 0

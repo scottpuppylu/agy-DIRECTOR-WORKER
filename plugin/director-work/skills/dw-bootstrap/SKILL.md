@@ -22,7 +22,7 @@ description: >-
 3. **建置 `<DIRECTOR>/` 與專案 `.agents/` 設定**：
    - 先跑 dry-run 檢視：
      `python -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --director <DIRECTOR> --rules <RULES> --init-director`
-   - 確認無誤後加 `--apply` 寫入（自動產生 `.agents/hooks.json`、`.agents/plugins.json`、`.git/info/exclude` 與 `<DIRECTOR>/` 骨架）。
+   - 確認無誤後加 `--apply` 寫入（自動產生 `.agents/hooks.json`、`.agents/plugins.json`、Git common `info/exclude`、每專案獨立 `<DIRECTOR>` 骨架與預設受限 `.sessions.json`）；接著以 `--register-director <CONVERSATION_ID> --apply` 登記總監對話。
 4. **量基準與環境自檢**：
    - 規則大小：`python -I -X utf8 <RULES>/tools/memory_size_check.py --kind rules --file <REPO>/AGENTS.md`（若無專案規則改查 `<RULES>/plugin/director-work/rules/AGENTS.md`）。
    - 環境與沙箱自檢：`python -I -X utf8 <RULES>/tools/agy_doctor.py --repo <REPO> --plugin <RULES>/plugin/director-work --probe-hooks`。

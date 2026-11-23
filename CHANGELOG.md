@@ -3,6 +3,28 @@
 本 repo 是 [DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK) `v2.6.0`（commit `787f67b`）在 Google Antigravity（App 2.0 / `agy` CLI / IDE / Python SDK）的原生移植版（簡稱 `agydw`），並承襲同作者 `dsh-DIRECTOR-WORKER`（`v2.6.0-ds.6`）的雙軌上游同步架構與安全閘門。
 上游完整變更歷史保留在 [`CHANGELOG-upstream.md`](CHANGELOG-upstream.md)；本檔只記 `agy-DIRECTOR-WORKER` 自己的版本與「對齊初衷」。
 
+## 2.6.0-agy.3（2026-11-24）
+
+針對獨立深度審查發現的「候選提交／執行終態／專案歸屬」三大綁定漏洞與 11 項實測缺陷進行徹底根治，並全面保留 39/39 份上游 `DIRECTOR-WORK v2.6.0` 核心檔 SHA-256 一致：
+
+### 關鍵修正與強化
+- **候選提交一致性綁定（`tools/scope_check.py`）**：
+  - 指定 `--candidate` 時（非 `--shared` 模式），`SCOPE`、`FORBIDDEN`、`OUTSIDE`、`PROTECTED`、`SIZE` 與 `REQUIRED_CHANGES` 全部統一對齊同一份 `since..commit` 候選差異，徹底消除總監在乾淨 `main` 分支審查 worker SHA 時漏報違規的問題。
+- **執行終態、關聯 ID 配對與尾部掃描預算（`tools/agy_audit.py`）**：
+  - 顯式區分完成終態（`DONE` / `OK` / `SUCCEEDED` / `SUCCESS` / `COMPLETED`）與非終態（`RUNNING` / `PENDING` / `IN_PROGRESS` 或 `Process still running`），`RUNNING` 步驟記為 `result.status="running"`（不再誤標 `ok`，確保 `report_vs_audit.py` 拒絕假通過）。
+  - `extract_calls_from_transcript` 優先依據 `tool_call_id` / `call_id` / `id` 關聯配對，不存在歧義 FIFO 錯配；`--include-subagents` 只從真實派工工具（`invoke_subagent` / `swarm` / `Agent` / `Task`）抽取子對話 ID；`_scan_tail_for_step` 與 `agy_hook_bridge.py` 採最大 2 MiB 不重疊視窗，避免缺失步驟時重讀並峰值配置整份大檔。
+- **每專案獨立狀態目錄、會話角色綁定、版本升級與原子安裝（`agy_setup.py`、`agy_guard.py`、`agy_setup_check.py`、`agy_doctor.py`）**：
+  - 預設狀態目錄改為每專案獨立 `<PRIMARY_REPO>/../DIRECTOR-<repo>`（同步支援連結 worktree 共用與舊版 `DIRECTOR/` 歸屬升級檢查），寫入 Git `common-dir` 指紋並由 `agy_setup_check.py` 跨專案拒檢；`info/exclude` 透過 `git rev-parse --git-path info/exclude` 正確寫入 Git common dir。
+  - `agy_setup.py` 預設接通 `--sessions <DIRECTOR>/.sessions.json`（`default: "worker"`，只有透過 `--register-director <CID>` 註冊的總監對話才可寫 `DIRECTOR_LOG.md` 與 `orders/`，同時保護 `.sessions.json` 本身與修正 `BOOTSTRAP` `--protect` 參數），並在 POSIX（如含 `$` 路徑）改用 `shlex.quote`。
+  - 實作實質預檢後再寫入的兩階段原子提交；從已複製的 `DIRECTOR/tools/agy_setup.py` 重跑可自動回溯 manifest/state 定位規則根目錄；重新執行 `agy_setup.py` 會比較每個工具檔案 SHA-256，備份舊版並升級 `DIRECTOR/tools/` 與 `.agents/plugins.json` 內舊版 `director-work` 路徑。
+  - `agy_setup_check.py --strict` 與 `agy_doctor.py` 強制檢查 `enabled`、`matcher` 對核心工具覆蓋率及全部 4 個生命週期（`SessionStart`/`PostToolUse`/`PreInvocation`/`Stop`），停用或失效 Matcher 一律判 `FAIL` 且不報 `HOOK_EXEC_OK`，並回報實際啟用工具版本。
+- **收尾閘門與續接橋接硬化（`tools/gate_check.py`、`tools/agy_hook_bridge.py`）**：
+  - `gate_check.py --final` 會拒絕含非零退出碼或 `FAILED` / `ERROR:` / `Traceback` 的 E2E 紀錄，且缺漏 `totals.total_tokens` 的空 `{}` `usage.json` 回報 `WARN USAGE`（不再報 `ok`）。
+  - `agy_hook_bridge.py stop-check` 同時轉接 `model_stop` / `END_TURN` / `fullyIdle` 與偵測已提交 `HEAD` 新於 `RESUME_STATE.md`（並附 `--state-dir` 單次防迴圈保護）；`pre-invocation` 以檔頭雜湊與大小偵測 transcript 輪替截短並重新注入 `RESUME_STATE`。
+- **用量歸屬與盲審／外掛相容性（`tools/agy_usage.py`、`plugin/director-work/`）**：
+  - `agy_usage.py --project-dir` 改採路徑邊界正則比對避免 `/app` 誤抓 `/app-long`，非數字 token 欄位安全跳過並計入 `invalid_metric_fields`。
+  - `dw-blind-reviewer.md` 明確設 `inheritMcp: false` 與 `inheritCustomizations: false` 並於 `agy_doctor.py` 強制檢查；`plugin/director-work/hooks.json` 改用 `python ... || python3 ...` 相容僅有 `python3` 的 Linux/Ubuntu 環境。
+
 ## 2.6.0-agy.2（2026-11-24）
 
 基於獨立第三方審查重現結果，針對首次安裝體驗、總監權限邊界、稽核誠實性與長對話效能進行關鍵修補：

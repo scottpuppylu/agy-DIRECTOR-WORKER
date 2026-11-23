@@ -17,6 +17,8 @@ Exit codes: 0 no FAIL, 1 any FAIL, 2 input/usage error. Never modifies ~/.gemini
 """
 import argparse
 import datetime
+import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -163,6 +165,59 @@ def _extract_pretool_command(hooks_obj, preferred_group=None):
     return None
 
 
+def _validate_hooks_dict(data):
+    """Share strict hook structure checks with agy_setup_check.py."""
+    sc_path = HERE / "agy_setup_check.py"
+    if sc_path.is_file():
+        spec = importlib.util.spec_from_file_location("_agy_doc_setup_check", sc_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.validate_hooks_structure(data)
+    if not isinstance(data, dict):
+        return ["hooks config must be a JSON object"], None
+    return [], _extract_pretool_command(data, "agydw-guard")
+
+
+def _check_active_tools_version(cmd_line):
+    """Verify active agy_guard.py copy against AGYDW_TOOLS_MANIFEST.json and current VERSION."""
+    if not cmd_line:
+        return None
+    m = re.search(r'"([^"]*?agy_guard\.py)"|\'([^\']*?agy_guard\.py)\'|([^\s"\']*agy_guard\.py)', cmd_line)
+    if not m:
+        return None
+    guard_path = pathlib.Path(next(g for g in m.groups() if g))
+    if not guard_path.is_file():
+        return check_item("active_tools_version", "FAIL", f"configured agy_guard.py missing: {guard_path.as_posix()}")
+    tools_dir = guard_path.parent
+    manifest_p = tools_dir / "AGYDW_TOOLS_MANIFEST.json"
+    vf = HERE.parent / "VERSION"
+    repo_ver = vf.read_text(encoding="utf-8-sig", errors="replace").strip() if vf.is_file() else None
+    repo_guard = HERE / "agy_guard.py"
+    cur_guard_sha = hashlib.sha256(guard_path.read_bytes()).hexdigest()
+
+    if tools_dir.resolve() == HERE.resolve():
+        return check_item("active_tools_version", "OK", f"running directly from rules tools/ (version={repo_ver or 'source'}, sha256={cur_guard_sha[:12]})")
+
+    if not manifest_p.is_file():
+        return check_item("active_tools_version", "WARN", f"unmanifested/legacy tools copy at {tools_dir.as_posix()} (sha256={cur_guard_sha[:12]}; run agy_setup.py --apply to upgrade)")
+    try:
+        mdata = json.loads(manifest_p.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        return check_item("active_tools_version", "WARN", f"corrupt {manifest_p.name}: {exc}")
+
+    inst_ver = str(mdata.get("version") or "unknown")
+    want_sha = (mdata.get("files") or {}).get("agy_guard.py")
+    if want_sha and want_sha != cur_guard_sha:
+        return check_item("active_tools_version", "WARN", f"tools copy at {tools_dir.as_posix()} modified after install (manifest {inst_ver})")
+    if repo_ver and inst_ver != repo_ver:
+        return check_item("active_tools_version", "WARN", f"active tools version {inst_ver} differs from rules repo {repo_ver}; re-run agy_setup.py --apply")
+    if repo_guard.is_file():
+        repo_sha = hashlib.sha256(repo_guard.read_bytes()).hexdigest()
+        if repo_sha != cur_guard_sha:
+            return check_item("active_tools_version", "WARN", f"active agy_guard.py differs from {HERE.as_posix()}; re-run agy_setup.py --apply")
+    return check_item("active_tools_version", "OK", f"active tools version={inst_ver} at {tools_dir.as_posix()} (sha256={cur_guard_sha[:12]})")
+
+
 def check_hooks_and_probe(repo, probe_hooks):
     """Validate .agents/hooks.json, .agents/plugins.json, and live-execute configured hook commands."""
     items = []
@@ -173,23 +228,21 @@ def check_hooks_and_probe(repo, probe_hooks):
         if hooks_path.is_file():
             try:
                 data = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
-                if not isinstance(data, dict):
-                    items.append(check_item("workspace_hooks_config", "FAIL", f"{hooks_path.as_posix()} must be a JSON object"))
+                h_probs, cmd_line = _validate_hooks_dict(data)
+                if h_probs:
+                    items.append(check_item("workspace_hooks_config", "FAIL", "; ".join(h_probs)))
+                    items.append(check_item("workspace_hook_exec", "NOT_ENFORCED", "skipped/not enforced because workspace hook config has failing lifecycle/matcher/enabled rules"))
+                    ran_workspace_exec = True
                 else:
-                    guard_grp = data.get("agydw-guard")
-                    bridge_grp = data.get("agydw-audit-and-bridge")
-                    has_guard = isinstance(guard_grp, dict) and bool(_extract_pretool_command({"agydw-guard": guard_grp}, "agydw-guard"))
-                    has_bridge = isinstance(bridge_grp, dict) and isinstance(bridge_grp.get("PostToolUse"), list)
-                    if has_guard and has_bridge:
-                        items.append(check_item("workspace_hooks_config", "CONFIGURED", f"{hooks_path.as_posix()} configured with agydw-guard + agydw-audit-and-bridge ({len(data)} total group(s))"))
-                        cmd_line = _extract_pretool_command(data, "agydw-guard")
-                        m_mode = re.search(r"--mode\s+(remind|ask|block)\b", cmd_line or "")
-                        mode = m_mode.group(1) if m_mode else "remind"
-                        items.append(_probe_pretool_command("workspace_hook_exec", cmd_line, hooks_path.parent, mode=mode))
-                        ran_workspace_exec = True
-                    else:
-                        missing = [n for n, ok in (("agydw-guard", has_guard), ("agydw-audit-and-bridge", has_bridge)) if not ok]
-                        items.append(check_item("workspace_hooks_config", "FAIL", f"{hooks_path.as_posix()} missing agydw group(s): {', '.join(missing)} (run agy_setup.py --apply)"))
+                    items.append(check_item("workspace_hooks_config", "CONFIGURED", f"{hooks_path.as_posix()} configured & enabled across core PreToolUse matchers and all 4 lifecycle events ({len(data)} group(s))"))
+                    m_mode = re.search(r"--mode\s+(remind|ask|block)\b", cmd_line or "")
+                    mode = m_mode.group(1) if m_mode else "remind"
+                    items.append(_probe_pretool_command("workspace_hook_exec", cmd_line, hooks_path.parent, mode=mode))
+                    ver_item = _check_active_tools_version(cmd_line)
+                    if ver_item:
+                        items.append(ver_item)
+                    items.append(check_item("live_host_hook_dispatch", "CONFIGURED_NOT_VERIFIED", "command probes succeeded locally; host App/IDE/CLI event firing requires runtime audit verification"))
+                    ran_workspace_exec = True
             except (OSError, ValueError) as exc:
                 items.append(check_item("workspace_hooks_config", "FAIL", f"{hooks_path.as_posix()} invalid JSON: {exc}"))
         else:
@@ -344,11 +397,17 @@ def check_plugin_dir(plugin_dir):
             items.append(check_item("plugin_agent", "FAIL", f"{agent.name}: missing frontmatter"))
             continue
         m_tools = re.search(r"^tools:\s*\[([^\]]*)\]", fm.group(1), re.M)
+        tools_list = [t.strip().strip("'\"") for t in m_tools.group(1).split(",") if t.strip()] if m_tools else []
         if m_tools:
-            tools_list = [t.strip().strip("'\"") for t in m_tools.group(1).split(",") if t.strip()]
             risky = [t for t in tools_list if t in HANG_RISK_AGENT_TOOLS]
             if risky:
                 items.append(check_item("plugin_agent", "FAIL", f"{agent.name}: unmapped App 2.0 tool(s) {risky} risk subagent hang"))
+                continue
+        if agent.name == "dw-blind-reviewer.md":
+            imcp = re.search(r"^inheritMcp:\s*false\b", fm.group(1), re.M)
+            icust = re.search(r"^inheritCustomizations:\s*false\b", fm.group(1), re.M)
+            if tools_list != ["read_file"] or not imcp or not icust:
+                items.append(check_item("plugin_agent", "FAIL", f"{agent.name}: blind reviewer requires tools: [read_file], inheritMcp: false, inheritCustomizations: false"))
                 continue
         items.append(check_item("plugin_agent", "OK", f"agent `{agent.stem}` valid"))
     return items
@@ -431,7 +490,10 @@ def main(argv=None):
     items = []
     # 1. Python & Git
     pv = sys.version_info
-    items.append(check_item("python", "OK" if pv >= (3, 9) else "FAIL", f"Python {pv.major}.{pv.minor}.{pv.micro}"))
+    py_note = ""
+    if os.name != "nt" and not shutil.which("python") and shutil.which("python3"):
+        py_note = " (PATH has python3 only; plugin seatbelt uses python || python3 fallback)"
+    items.append(check_item("python", "OK" if pv >= (3, 9) else "FAIL", f"Python {pv.major}.{pv.minor}.{pv.micro}{py_note}"))
     git_bin = shutil.which("git")
     items.append(check_item("git", "OK" if git_bin else "FAIL", git_bin or "git not found on PATH"))
 

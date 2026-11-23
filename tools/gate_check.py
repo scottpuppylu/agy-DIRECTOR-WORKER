@@ -1384,9 +1384,7 @@ def base_ref_problems(order_text, repo, config, notes, fetched):
 
 
 def usage_lines(director, usage=None):
-    """2.2.5-ds.5 (WO-DS-009 B2): the lines about DIRECTOR/usage.json (or usage) for the final mode. Never a failure:
-    a missing, unreadable or NO_DATA file is `~ WARN USAGE` (the trial's token total was UNKNOWN because the lead never
-    ran `agy_usage.py --out`)."""
+    """2.2.5-ds.5 / agy.3: validate DIRECTOR/usage.json schema for --final (never accept empty {})."""
     base = pathlib.Path(director)
     if not usage and not (base / "usage.json").exists() and (base / "DIRECTOR").is_dir():
         base = base / "DIRECTOR"  # a folder holding DIRECTOR/, as final_problems reads it
@@ -1398,11 +1396,20 @@ def usage_lines(director, usage=None):
                 "the last step (BOOTSTRAP 「收尾」)"]
     except (OSError, ValueError) as error:
         return [f"  ~ WARN USAGE: {usage_path} unreadable: {error}"]
-    status = data.get("status") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return [f"  ~ WARN USAGE: {usage_path} is not a agy_usage.py --out JSON object"]
+    status = data.get("status")
     if status == "NO_DATA":
         return [f"  ~ WARN USAGE: {usage_path} says NO_DATA ({data.get('reason', '')}); the usage cannot be compared"]
-    if not isinstance(data, dict):
-        return [f"  ~ WARN USAGE: {usage_path} is not a agy_usage.py --out file"]
+    if status is not None and status != "OK":
+        return [f"  ~ WARN USAGE: {usage_path} has unexpected status {status!r}; re-run agy_usage.py --out"]
+    totals = data.get("totals")
+    tot_tok = totals.get("total_tokens") if isinstance(totals, dict) else None
+    sessions = data.get("sessions")
+    if not isinstance(totals, dict) or not isinstance(tot_tok, (int, float)) or isinstance(tot_tok, bool) or (
+        "sessions" in data and not isinstance(sessions, list)
+    ):
+        return [f"  ~ WARN USAGE: {usage_path} missing required usage fields (totals.total_tokens); re-run agy_usage.py --out"]
     return [f"  ok USAGE: {usage_path}"]
 
 
@@ -1993,6 +2000,11 @@ def sequence_problems(order_text, order_path, log_text, log_path, repo, notes):
 
 
 E2E_ENTRY = re.compile(r"^[ \t]*ENTRY_POINT[ \t]*[:=][ \t]*\S", re.M)
+E2E_EXIT = re.compile(
+    r"^[ \t]*EXIT_CODE[ \t]*[:=][ \t]*(-?\d+)\b|\bexit[ \t]*=[ \t]*(-?\d+)\b|\bCommand exited with code[ \t]+(-?\d+)\b",
+    re.I | re.M,
+)
+E2E_FAIL_MARKER = re.compile(r"^[ \t]*(?:FAILED\b|FAIL\b|ERROR:|Traceback \(most recent call last\):)", re.M)
 
 
 FEAS_FIELD = re.compile(r"^[ \t]*(FEASIBILITY|FEASIBLE_COUNT|SCRIPT|RESULT)[ \t]*[:=][ \t]*(.*?)[ \t]*$", re.M)
@@ -2082,8 +2094,29 @@ def final_problems(folder, notes):
     if not records:
         problems.append(f"E2E: no end-to-end evidence in {e2e}; before the final verdict the lead runs the spec's "
                         "scenarios once through the product's public entry point and keeps the output there")
-    elif not any(E2E_ENTRY.search(read_or_none(p) or "") for p in records):
-        notes.append(f"WARN E2E: no record in {e2e} names its `ENTRY_POINT:` (the one public entry point it ran)")
+    else:
+        texts = [(p, read_or_none(p) or "") for p in records]
+        if not any(E2E_ENTRY.search(txt) for _, txt in texts):
+            notes.append(f"WARN E2E: no record in {e2e} names its `ENTRY_POINT:` (the one public entry point it ran)")
+        saw_zero_exit = False
+        e2e_failed = False
+        for p, txt in texts:
+            for xm in E2E_EXIT.finditer(txt):
+                code_str = next((g for g in xm.groups() if g is not None), None)
+                if code_str is None:
+                    continue
+                code = int(code_str)
+                if code != 0:
+                    problems.append(f"E2E: {p.name} recorded non-zero exit code ({code})")
+                    e2e_failed = True
+                else:
+                    saw_zero_exit = True
+            fm = E2E_FAIL_MARKER.search(txt)
+            if fm:
+                problems.append(f"E2E: {p.name} contains failure marker ({fm.group(0).strip()})")
+                e2e_failed = True
+        if not e2e_failed and not saw_zero_exit:
+            notes.append(f"WARN E2E: no record in {e2e} explicitly states exit code 0 (e.g. `EXIT_CODE: 0`)")
     register = base / "DECISION_REGISTER.md"
     text = read_or_none(register) if register.is_file() else None
     if text is None:

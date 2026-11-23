@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -B -I -X utf8 scripts/seatbelt_hook.py --profile worker --mode remind",
+            "command": "python -B -I -X utf8 scripts/seatbelt_hook.py --profile worker --mode remind --format antigravity || python3 -B -I -X utf8 scripts/seatbelt_hook.py --profile worker --mode remind --format antigravity",
             "timeout": 15
           }
         ]

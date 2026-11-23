@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Antigravity hash-chained action audit & loop/injection scanner (2.6.0-agy.1).
+"""Antigravity hash-chained action audit & loop/injection scanner (2.6.0-agy.3).
 
 Reuses upstream tools/audit_log.py (hash chain, locking, verification), tools/loop_guard.py
 (loop detection), tools/inject_scan.py (prompt injection scanning), and tools/secret_mask.py
@@ -31,12 +31,18 @@ import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-REBUILD_VERSION = "2.6.0-agy.2"
+REBUILD_VERSION = "2.6.0-agy.3"
 READ_TOOLS = {"read_file", "view_file", "list_dir"}
 SUBAGENT_TOOLS = {"invoke_subagent", "swarm", "Agent", "Task"}
+TERMINAL_OK_STATUSES = {"DONE", "OK", "SUCCEEDED", "SUCCESS", "COMPLETED"}
+NONTERMINAL_STATUSES = {"RUNNING", "PENDING", "IN_PROGRESS", "QUEUED", "STARTED", "WAITING"}
+ERROR_STATUSES = {"ERROR", "FAILED", "FAIL", "TIMED_OUT", "TIMEOUT"}
+INTERRUPTED_STATUSES = {"CANCELED", "CANCELLED", "INTERRUPTED", "ABORTED"}
 CREATED_RE = re.compile(r"^Created At:\s*(\S+)", re.M)
 COMPLETED_RE = re.compile(r"^Completed At:\s*(\S+)", re.M)
 EXIT_NONZERO_RE = re.compile(r"Command exited with code (-?[1-9]\d*)\.")
+EXIT_ZERO_RE = re.compile(r"Command exited with code 0\.")
+STILL_RUNNING_RE = re.compile(r"\b(?:process still running|command is still running|running in background)\b", re.I)
 SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([0-9a-f-]{8,})"')
 
 
@@ -111,6 +117,25 @@ def parse_iso(text):
         return None
 
 
+def classify_step_outcome(status_val, content, err=None):
+    """Classify terminal outcomes explicitly; keep RUNNING/non-terminal distinct from ok."""
+    if err:
+        return "failure", "error"
+    st = str(status_val).strip().upper() if status_val is not None else ""
+    body = content if isinstance(content, str) else ""
+    if st in INTERRUPTED_STATUSES:
+        return "failure", "interrupted"
+    if st in ERROR_STATUSES or (body and EXIT_NONZERO_RE.search(body)):
+        return "failure", "error"
+    if st in NONTERMINAL_STATUSES or (body and STILL_RUNNING_RE.search(body) and not EXIT_ZERO_RE.search(body)):
+        return "result", "running"
+    if st in TERMINAL_OK_STATUSES:
+        return "result", "ok"
+    if st == "":
+        return ("result", "ok") if (body and EXIT_ZERO_RE.search(body)) else ("result", "unverified")
+    return "result", "unverified"
+
+
 def parse_step_timing_and_error(content, status):
     """Extract duration_ms and error status from an Antigravity GENERIC step body."""
     duration_ms = None
@@ -119,9 +144,21 @@ def parse_step_timing_and_error(content, status):
         t1, t2 = parse_iso(m1.group(1)), parse_iso(m2.group(1))
         if t1 and t2:
             duration_ms = max(0, int((t2 - t1).total_seconds() * 1000))
-    is_err = (status == "ERROR") or bool(EXIT_NONZERO_RE.search(content))
-    is_int = (status in ("CANCELED", "CANCELLED", "INTERRUPTED"))
+    _, res_status = classify_step_outcome(status, content)
+    is_err = (res_status == "error")
+    is_int = (res_status == "interrupted")
     return duration_ms, is_err, is_int
+
+
+def _extract_call_id(obj, keys):
+    """Return first non-empty correlation ID string among keys in obj dict."""
+    if not isinstance(obj, dict):
+        return None
+    for k in keys:
+        val = obj.get(k)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
 
 
 def parse_raw_args(tc):
@@ -139,8 +176,8 @@ def parse_raw_args(tc):
     return raw if isinstance(raw, dict) else {}
 
 
-def _scan_tail_for_step(path, step_idx, require_generic=False):
-    """Scan JSONL from EOF in growing tail chunks using byte prefilter before JSON parsing."""
+def _scan_tail_for_step(path, step_idx, require_generic=False, max_scan_bytes=2 * 1024 * 1024):
+    """Scan JSONL backwards in bounded non-overlapping windows using a byte prefilter before JSON parsing."""
     if not path.is_file() or step_idx is None:
         return None
     try:
@@ -150,23 +187,36 @@ def _scan_tail_for_step(path, step_idx, require_generic=False):
     if size <= 0:
         return None
     needle = str(step_idx).encode("ascii")
-    chunks = (65536, 262144, 1048576, 4194304, size)
-    seen_chunks = set()
+    windows = (65536, 196608, 786432, 1048576)
+    pos = size
+    scanned = 0
+    carry = b""
+    idx = 0
     try:
         with open(path, "rb") as fh:
-            for span in chunks:
-                span = min(span, size)
-                if span in seen_chunks:
-                    continue
-                seen_chunks.add(span)
-                offset = max(0, size - span)
-                fh.seek(offset)
-                raw = fh.read(span)
-                if offset > 0:
-                    nl = raw.find(b"\n")
+            while pos > 0 and scanned < max_scan_bytes:
+                win = windows[idx] if idx < len(windows) else windows[-1]
+                idx += 1
+                win = min(win, pos, max_scan_bytes - scanned)
+                if win <= 0:
+                    break
+                start = pos - win
+                fh.seek(start)
+                buf = fh.read(win) + carry
+                pos = start
+                scanned += win
+                if start > 0:
+                    nl = buf.find(b"\n")
                     if nl >= 0:
-                        raw = raw[nl + 1:]
-                for line in reversed(raw.splitlines()):
+                        carry = buf[:nl + 1]
+                        complete = buf[nl + 1:]
+                    else:
+                        carry = buf
+                        continue
+                else:
+                    carry = b""
+                    complete = buf
+                for line in reversed(complete.splitlines()):
                     if not line.strip() or needle not in line:
                         continue
                     try:
@@ -177,8 +227,6 @@ def _scan_tail_for_step(path, step_idx, require_generic=False):
                         if require_generic and obj.get("type") != "GENERIC":
                             continue
                         return obj
-                if offset == 0:
-                    break
     except OSError:
         return None
     return None
@@ -291,25 +339,26 @@ def discover_transcripts(transcript_files, conversations, brain_roots, include_s
         idx += 1
         out.append((cid, path, parent))
         if include_subagents and path.is_file():
-            steps, _ = load_transcript_steps(path)
-            for st in steps:
-                if st.get("type") == "GENERIC":
-                    for sub_cid in SUBAGENT_CID_RE.findall(st.get("content") or ""):
-                        for root in [path.parent.parent.parent.parent] + roots:
-                            sub_tp = root / sub_cid / ".system_generated" / "logs" / "transcript.jsonl"
-                            if sub_tp.is_file():
-                                sp = sub_tp.resolve()
-                                if str(sp).lower() not in seen:
-                                    seen.add(str(sp).lower())
-                                    queue.append((sub_cid, sp, cid))
-                                break
+            calls, _, _ = extract_calls_from_transcript(cid, path, parent_cid=parent)
+            for c in calls:
+                if c["tool_raw"] not in SUBAGENT_TOOLS:
+                    continue
+                for sub_cid in SUBAGENT_CID_RE.findall(c.get("content") or ""):
+                    for root in [path.parent.parent.parent.parent] + roots:
+                        sub_tp = root / sub_cid / ".system_generated" / "logs" / "transcript.jsonl"
+                        if sub_tp.is_file():
+                            sp = sub_tp.resolve()
+                            if str(sp).lower() not in seen:
+                                seen.add(str(sp).lower())
+                                queue.append((sub_cid, sp, cid))
+                            break
     return out
 
 
 def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
-    """Pair PLANNER_RESPONSE.tool_calls with subsequent GENERIC steps in order."""
+    """Pair PLANNER_RESPONSE.tool_calls with subsequent GENERIC steps (correlation ID first, else FIFO)."""
     steps, tp = load_transcript_steps(transcript_path)
-    pending = collections.deque()
+    pending = []
     calls = []
     no_result = 0
     model_seen = None
@@ -324,15 +373,24 @@ def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
             tcs = st.get("tool_calls") or []
             for tc in tcs:
                 if isinstance(tc, dict):
-                    pending.append((tc, st.get("step_index"), st.get("created_at")))
+                    tc_id = _extract_call_id(tc, ("id", "call_id", "tool_call_id", "toolCallId", "tool_use_id"))
+                    pending.append((tc, tc_id, st.get("step_index"), st.get("created_at")))
         elif stype == "GENERIC" and pending:
-            tc, p_step, p_ts = pending.popleft()
+            step_cid = _extract_call_id(st, ("tool_call_id", "toolCallId", "call_id", "callId", "tool_use_id"))
+            if step_cid:
+                match_idx = next((i for i, item in enumerate(pending) if item[1] == step_cid), None)
+                if match_idx is None:
+                    continue
+                tc, tc_id, p_step, p_ts = pending.pop(match_idx)
+            else:
+                tc, tc_id, p_step, p_ts = pending.pop(0)
             raw_name = tc.get("name") or "?"
             raw_args = parse_raw_args(tc)
             tool, tool_raw, norm_input = normalize_tool_and_input(raw_name, raw_args)
             content = st.get("content") or ""
-            status_val = st.get("status") or "DONE"
+            status_val = st.get("status") if "status" in st else "DONE"
             dur, is_err, is_int = parse_step_timing_and_error(content, status_val)
+            kind, res_status = classify_step_outcome(status_val, content)
             ts_str = st.get("created_at") or p_ts
             calls.append({
                 "conv_id": conv_id,
@@ -340,6 +398,7 @@ def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
                 "parent_id": parent_cid,
                 "step_idx": st.get("step_index"),
                 "planner_step": p_step,
+                "tc_id": tc_id or step_cid,
                 "tool": tool,
                 "tool_raw": tool_raw,
                 "input_obj": norm_input,
@@ -347,6 +406,8 @@ def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
                 "duration_ms": dur,
                 "is_err": is_err,
                 "is_int": is_int,
+                "kind": kind,
+                "result_status": res_status,
                 "ts_str": ts_str,
                 "ts_dt": parse_iso(ts_str),
                 "model": model_seen,
@@ -392,15 +453,8 @@ def cmd_hook_append(args):
         kind = "failure"
         res = audit.output_record("error", err)
     elif found_step:
-        if step_status == "ERROR" or (body and EXIT_NONZERO_RE.search(body)):
-            kind = "failure"
-            res = audit.output_record("error", body)
-        elif step_status in ("CANCELED", "CANCELLED", "INTERRUPTED"):
-            kind = "failure"
-            res = audit.output_record("interrupted", body)
-        else:
-            kind = "result"
-            res = audit.output_record("ok", body)
+        kind, res_status = classify_step_outcome(step_status, body)
+        res = audit.output_record(res_status, body)
     else:
         # Honest reporting: never claim status=ok when neither error nor matching tool output was observed
         kind = "result"
@@ -493,15 +547,8 @@ def cmd_build(args):
     for seq, c in enumerate(all_calls, 2):
         input_str = audit.summary(c["input_obj"], limit=args.input_limit)
         input_cut = args.input_limit is not None and len(audit.summary(c["input_obj"], limit=None)) > args.input_limit
-        if c["is_int"]:
-            kind = "failure"
-            res = audit.output_record("interrupted", c["content"])
-        elif c["is_err"]:
-            kind = "failure"
-            res = audit.output_record("error", c["content"])
-        else:
-            kind = "result"
-            res = audit.output_record("ok", c["content"])
+        kind = c["kind"]
+        res = audit.output_record(c["result_status"], c["content"])
         ts_out = (c["ts_dt"] or datetime.datetime.now(datetime.timezone.utc)).isoformat(timespec="milliseconds")
         entry = {
             "seq": seq,
@@ -510,7 +557,7 @@ def cmd_build(args):
             "agent_id": c["agent_id"],
             "tool": c["tool"],
             "tool_raw": c["tool_raw"],
-            "tool_use_id": f"step-{c['step_idx']}",
+            "tool_use_id": c.get("tc_id") or f"step-{c['step_idx']}",
             "input": input_str,
             "kind": kind,
             "result": res,
@@ -572,7 +619,7 @@ def cmd_verify(args):
     finally:
         sys.argv = old_argv
     if rc == 0 and pathlib.Path(args.log).is_file():
-        c_ok = c_err = c_unv = 0
+        c_ok = c_err = c_unv = c_run = 0
         try:
             for line in pathlib.Path(args.log).read_text(encoding="utf-8", errors="replace").splitlines():
                 if not line.strip():
@@ -584,9 +631,11 @@ def cmd_verify(args):
                         c_ok += 1
                     elif st in ("error", "interrupted"):
                         c_err += 1
+                    elif st == "running":
+                        c_run += 1
                     elif st == "unverified":
                         c_unv += 1
-            print(f"AGY_AUDIT_STATUS: chain=OK confirmed_ok={c_ok} confirmed_error={c_err} unverified={c_unv}")
+            print(f"AGY_AUDIT_STATUS: chain=OK confirmed_ok={c_ok} confirmed_error={c_err} unverified={c_unv} running={c_run}")
         except (OSError, ValueError):
             pass
     return rc

@@ -112,8 +112,8 @@ def render_resume_text(resume_path, max_bytes=2048):
     return ri.render(text, path.as_posix(), max_bytes, ri.DEFAULT_SECTIONS).rstrip("\n")
 
 
-def _scan_tail_step(path, step_idx):
-    """Scan JSONL from EOF in growing chunks using byte prefilter before JSON parsing."""
+def _scan_tail_step(path, step_idx, max_scan_bytes=2 * 1024 * 1024):
+    """Scan JSONL backwards in bounded non-overlapping windows using a byte prefilter before JSON parsing."""
     if not path.is_file() or step_idx is None:
         return None
     try:
@@ -123,23 +123,36 @@ def _scan_tail_step(path, step_idx):
     if size <= 0:
         return None
     needle = str(step_idx).encode("ascii")
-    chunks = (65536, 262144, 1048576, 4194304, size)
-    seen = set()
+    windows = (65536, 196608, 786432, 1048576)
+    pos = size
+    scanned = 0
+    carry = b""
+    idx = 0
     try:
         with open(path, "rb") as fh:
-            for span in chunks:
-                span = min(span, size)
-                if span in seen:
-                    continue
-                seen.add(span)
-                offset = max(0, size - span)
-                fh.seek(offset)
-                raw = fh.read(span)
-                if offset > 0:
-                    nl = raw.find(b"\n")
+            while pos > 0 and scanned < max_scan_bytes:
+                win = windows[idx] if idx < len(windows) else windows[-1]
+                idx += 1
+                win = min(win, pos, max_scan_bytes - scanned)
+                if win <= 0:
+                    break
+                start = pos - win
+                fh.seek(start)
+                buf = fh.read(win) + carry
+                pos = start
+                scanned += win
+                if start > 0:
+                    nl = buf.find(b"\n")
                     if nl >= 0:
-                        raw = raw[nl + 1:]
-                for line in reversed(raw.splitlines()):
+                        carry = buf[:nl + 1]
+                        complete = buf[nl + 1:]
+                    else:
+                        carry = buf
+                        continue
+                else:
+                    carry = b""
+                    complete = buf
+                for line in reversed(complete.splitlines()):
                     if not line.strip() or needle not in line:
                         continue
                     try:
@@ -148,8 +161,6 @@ def _scan_tail_step(path, step_idx):
                         continue
                     if isinstance(obj, dict) and obj.get("step_index") == step_idx:
                         return obj
-                if offset == 0:
-                    break
     except OSError:
         return None
     return None
@@ -173,20 +184,31 @@ def find_step_text(transcript_path, step_idx):
     return content if isinstance(content, str) else ""
 
 
-def count_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0):
-    """Incrementally count SYSTEM/CHECKPOINT compaction steps using a byte offset cursor."""
+def file_head_sha(path, nbytes=512):
+    """Return SHA-256 hex digest of the leading bytes of path to detect rewrite/rotation."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read(nbytes)).hexdigest()
+    except OSError:
+        return None
+
+
+def track_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0, prev_head_sha=None):
+    """Incrementally count CHECKPOINT steps with file-identity rotation/truncation detection."""
     if not transcript_path:
-        return prev_count, prev_offset
+        return prev_count, prev_offset, prev_head_sha, False
     tp = pathlib.Path(transcript_path)
     if not tp.is_file():
-        return 0, 0
+        return 0, 0, None, False
     try:
         size = tp.stat().st_size
     except OSError:
-        return prev_count, prev_offset
-    if size == prev_offset:
-        return prev_count, prev_offset
-    if size < prev_offset:
+        return prev_count, prev_offset, prev_head_sha, False
+    cur_head_sha = file_head_sha(tp)
+    rotated = bool(prev_offset > 0 and (size < prev_offset or (prev_head_sha and cur_head_sha and cur_head_sha != prev_head_sha)))
+    if size == prev_offset and not rotated:
+        return prev_count, prev_offset, cur_head_sha, False
+    if rotated:
         prev_count, prev_offset = 0, 0
     added = 0
     new_offset = prev_offset
@@ -208,8 +230,14 @@ def count_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0):
                 if isinstance(obj, dict) and obj.get("type") == "CHECKPOINT":
                     added += 1
     except OSError:
-        return prev_count, prev_offset
-    return prev_count + added, new_offset
+        return prev_count, prev_offset, cur_head_sha, False
+    return prev_count + added, new_offset, cur_head_sha, rotated
+
+
+def count_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0):
+    """Backwards-compatible incremental checkpoint counter returning (count, new_offset)."""
+    cur, off, _, _ = track_checkpoints_incremental(transcript_path, prev_count, prev_offset, None)
+    return cur, off
 
 
 def count_checkpoints(transcript_path):
@@ -252,13 +280,13 @@ def cmd_session_start(args):
                 "metadata": {"user_markdown": f"> **agydw** 已載入（`{ws_label}`）— RESUME_STATE 已注入。"},
             }
         })
-    # Record initial checkpoint count + byte offset so pre-invocation incrementally tracks new compactions
+    # Record initial checkpoint count + byte offset + head hash for incremental & rotation tracking
     if args.state_dir and payload.get("transcriptPath"):
         folder = pathlib.Path(args.state_dir)
         folder.mkdir(parents=True, exist_ok=True)
         meta_file = folder / f"compaction_{safe_cid(payload.get('conversationId'))}.json"
-        cur, off = count_checkpoints_incremental(payload.get("transcriptPath"), 0, 0)
-        meta_file.write_text(json.dumps({"checkpoints": cur, "offset": off}), encoding="utf-8")
+        cur, off, hsha, _ = track_checkpoints_incremental(payload.get("transcriptPath"), 0, 0, None)
+        meta_file.write_text(json.dumps({"checkpoints": cur, "offset": off, "head_sha": hsha}), encoding="utf-8")
     print(json.dumps({"injectSteps": steps} if steps else {}, ensure_ascii=False))
     return 0
 
@@ -331,43 +359,104 @@ def cmd_pre_invocation(args):
             meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.is_file() else {}
             prev = int(meta.get("checkpoints", 0))
             prev_off = int(meta.get("offset", 0))
+            prev_head = meta.get("head_sha") if isinstance(meta.get("head_sha"), str) else None
         except (OSError, ValueError, TypeError):
-            prev, prev_off = 0, 0
-        cur, new_off = count_checkpoints_incremental(payload.get("transcriptPath"), prev, prev_off)
-        if cur > prev:
-            meta_file.write_text(json.dumps({"checkpoints": cur, "offset": new_off}), encoding="utf-8")
+            prev, prev_off, prev_head = 0, 0, None
+        cur, new_off, cur_head, rotated = track_checkpoints_incremental(payload.get("transcriptPath"), prev, prev_off, prev_head)
+        if cur > prev or (rotated and cur > 0):
+            meta_file.write_text(json.dumps({"checkpoints": cur, "offset": new_off, "head_sha": cur_head}), encoding="utf-8")
             messages.insert(0, "[compaction detected] " + render_resume_text(args.resume, args.max_bytes))
-        elif new_off != prev_off or not meta_file.is_file():
-            meta_file.write_text(json.dumps({"checkpoints": cur, "offset": new_off}), encoding="utf-8")
+        elif new_off != prev_off or cur_head != prev_head or not meta_file.is_file():
+            meta_file.write_text(json.dumps({"checkpoints": cur, "offset": new_off, "head_sha": cur_head}), encoding="utf-8")
 
     steps = [{"systemMessage": {"systemMessage": "\n\n".join(messages)}}] if messages else []
     print(json.dumps({"injectSteps": steps} if steps else {}, ensure_ascii=False))
     return 0
 
 
-def repo_has_newer_changes(repo, resume_path):
-    """True when tracked files in repo have uncommitted edits or repo HEAD is newer than resume_path."""
+STOP_TERMINATION_REASONS = {"NO_TOOL_CALL", "MODEL_STOP", "END_TURN"}
+
+
+def is_stop_check_eligible(payload):
+    """Support documented Antigravity Stop event schemas while avoiding infinite continuation loops."""
+    if payload.get("continuationActive") is True:
+        return False
+    reason = str(payload.get("terminationReason") or "").strip().upper()
+    if reason in STOP_TERMINATION_REASONS:
+        return True
+    if not reason and payload.get("fullyIdle") is True:
+        return True
+    return False
+
+
+def _repo_head_info(repo):
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "log", "-1", "--format=%H%x09%ct", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0 and "\t" in proc.stdout:
+            sha, ts_s = proc.stdout.strip().split("\t", 1)
+            return sha.strip(), float(ts_s.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return None, None
+
+
+def _check_resume_freshness(repo, resume_path):
+    """Check whether uncommitted workspace files OR committed HEAD are newer than resume_path."""
     if not resume_path.is_file():
-        return True, "RESUME_STATE.md does not exist yet"
+        return True, "RESUME_STATE.md does not exist yet", "missing"
+    resume_mtime = resume_path.stat().st_mtime
+    resume_txt = resume_path.read_text(encoding="utf-8-sig", errors="replace")
     try:
         proc = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, timeout=5)
-        if proc.returncode != 0:
-            return False, None
-        dirty = [line[3:].strip().split(" -> ")[-1] for line in proc.stdout.splitlines() if line.strip()]
+        dirty = [line[3:].strip().split(" -> ")[-1] for line in proc.stdout.splitlines() if line.strip()] if proc.returncode == 0 else []
     except (OSError, subprocess.SubprocessError):
-        return False, None
-    resume_mtime = resume_path.stat().st_mtime
+        dirty = []
     for rel in dirty:
         fp = pathlib.Path(repo) / rel
         if fp.is_file() and fp.resolve() != resume_path.resolve() and fp.stat().st_mtime > resume_mtime + 2:
-            return True, f"workspace file `{rel}` was modified after {resume_path.name}"
-    return False, None
+            return True, f"workspace file `{rel}` was modified after {resume_path.name}", f"dirty:{rel}:{int(fp.stat().st_mtime)}"
+
+    head_sha, head_ts = _repo_head_info(repo)
+    if head_sha:
+        m_vh = re.search(r"^[ \t]*(?:VERIFIED_HEAD|HEAD)[ \t]*:[ \t]*([0-9a-f]{7,40})\b", resume_txt, re.M)
+        if m_vh:
+            recorded = m_vh.group(1).lower()
+            if not head_sha.lower().startswith(recorded):
+                return True, f"repo HEAD ({head_sha[:10]}) differs from {resume_path.name} VERIFIED_HEAD ({recorded})", f"head:{head_sha}"
+        elif head_ts is not None and head_ts > resume_mtime + 2:
+            return True, f"repo HEAD ({head_sha[:10]}) was committed after {resume_path.name}", f"head:{head_sha}"
+    return False, None, None
+
+
+def repo_has_newer_changes(repo, resume_path):
+    """True when tracked files in repo have uncommitted edits or repo HEAD is newer than resume_path."""
+    stale, why, _ = _check_resume_freshness(repo, pathlib.Path(resume_path))
+    return stale, why
+
+
+def _stop_already_blocked(state_dir, conv_id, fp):
+    if not state_dir or not fp:
+        return False
+    folder = pathlib.Path(state_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    rec = folder / f"stop_guard_{safe_cid(conv_id)}.json"
+    try:
+        old = json.loads(rec.read_text(encoding="utf-8")) if rec.is_file() else {}
+    except (OSError, ValueError):
+        old = {}
+    if old.get("fingerprint") == fp:
+        return True
+    rec.write_text(json.dumps({"fingerprint": fp}), encoding="utf-8")
+    return False
 
 
 def cmd_stop_check(args):
     """Handle Antigravity Stop hook: prevent stopping without updating RESUME_STATE (anti-loop safe)."""
     payload = read_stdin_json()
-    if payload.get("continuationActive") is True or payload.get("terminationReason") != "NO_TOOL_CALL":
+    if not is_stop_check_eligible(payload):
         print(json.dumps({"decision": "allow"}))
         return 0
     if not args.enforce_resume or not args.resume:
@@ -376,18 +465,22 @@ def cmd_stop_check(args):
 
     resume_path = pathlib.Path(args.resume)
     repo = args.repo or payload.get("cwd") or ((payload.get("workspacePaths") or [None])[0]) or "."
-    # Validate RESUME_STATE header using gate_check if file exists
+    conv_id = payload.get("conversationId")
+    # Validate RESUME_STATE header if file exists
     if resume_path.is_file():
         text = resume_path.read_text(encoding="utf-8-sig", errors="replace")
         head_ok = all(re.search(rf"^{k}\s*:", text, re.M) for k in ("PROGRESS", "DOING", "NEXT_STEP", "COMMS"))
         if not head_ok:
-            print(json.dumps({
-                "decision": "continue",
-                "reason": f"agydw Stop guard: `{resume_path.as_posix()}` is missing the 4-line header (PROGRESS / DOING / NEXT_STEP / COMMS). Update it before ending.",
-            }, ensure_ascii=False))
+            if not _stop_already_blocked(args.state_dir, conv_id, "missing_header"):
+                print(json.dumps({
+                    "decision": "continue",
+                    "reason": f"agydw Stop guard: `{resume_path.as_posix()}` is missing the 4-line header (PROGRESS / DOING / NEXT_STEP / COMMS). Update it before ending.",
+                }, ensure_ascii=False))
+                return 0
+            print(json.dumps({"decision": "allow"}))
             return 0
-    stale, why = repo_has_newer_changes(repo, resume_path)
-    if stale:
+    stale, why, fp = _check_resume_freshness(repo, resume_path)
+    if stale and not _stop_already_blocked(args.state_dir, conv_id, fp):
         print(json.dumps({
             "decision": "continue",
             "reason": f"agydw Stop guard: {why}. Update `{resume_path.as_posix()}` (PROGRESS / DOING / NEXT_STEP / COMMS) before finishing.",
@@ -422,8 +515,9 @@ def main(argv=None):
 
     s4 = sub.add_parser("stop-check", help="Stop hook: ensure RESUME_STATE updated (never loops)")
     s4.add_argument("--resume", help="path to RESUME_STATE.md")
-    s4.add_argument("--repo", help="git checkout to compare mtime against")
-    s4.add_argument("--enforce-resume", action="store_true", help="continue once if code changed after RESUME_STATE")
+    s4.add_argument("--repo", help="git checkout to compare mtime and HEAD against")
+    s4.add_argument("--state-dir", help="optional bridge state directory for 1-shot anti-loop tracking")
+    s4.add_argument("--enforce-resume", action="store_true", help="continue once if code/HEAD changed after RESUME_STATE")
 
     try:
         a = ap.parse_args(argv)
