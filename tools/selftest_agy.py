@@ -28,6 +28,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -247,15 +248,24 @@ def test_agy_guard_matrix():
         assert json.loads(p02_blk.stdout).get("decision") == "deny", f"g02 block got {p02_blk.stdout}"
 
         # 4. --protect DIRECTOR
-        for key in ("protected_order_write_app2", "protected_log_edit_ide"):
-            pp = run_py(TOOLS_DIR / "agy_guard.py", ["--rules", str(rules), "--mode", "remind", "--protect", "D:/demo/DIRECTOR"], stdin_obj=ag[key], check_zero=True)
+        prot_dir = tmp / "DIRECTOR"
+        for key, tool_nm, arg_key, rel in (
+            ("protected_order_write_app2", "write_file", "Path", "orders/WO-001.md"),
+            ("protected_log_edit_ide", "replace_file_content", "TargetFile", "DIRECTOR_LOG.md"),
+        ):
+            payload_p = {
+                "hookEventName": "PreToolUse",
+                "conversationId": "conv-demo-001",
+                "toolCall": {"name": tool_nm, "args": {arg_key: (prot_dir / rel).as_posix()}},
+            }
+            pp = run_py(TOOLS_DIR / "agy_guard.py", ["--rules", str(rules), "--mode", "remind", "--protect", str(prot_dir)], stdin_obj=payload_p, check_zero=True)
             assert json.loads(pp.stdout).get("decision") == "deny", f"--protect failed for {key}: {pp.stdout}"
 
         # 5. --pause-flag via pause_ctl.py (read-only clean_cmd stays allowed; writes denied until unpaused)
         write_payload = {
             "hookEventName": "PreToolUse",
             "conversationId": "conv-demo-001",
-            "toolCall": {"name": "write_file", "args": {"Path": "D:/demo/repo/src/app.py"}},
+            "toolCall": {"name": "write_file", "args": {"Path": (tmp / "repo" / "src" / "app.py").as_posix()}},
         }
         run_py(TOOLS_DIR / "pause_ctl.py", ["on", "--flag", str(pause_flag), "--by", "director", "--reason", "e2e pause test"], check_zero=True)
         p_paused_ro = run_py(TOOLS_DIR / "agy_guard.py", ["--rules", str(rules), "--pause-flag", str(pause_flag)], stdin_obj=ag["clean_cmd"], check_zero=True)
@@ -796,11 +806,16 @@ NO MERGE / NO PUSH / NO FINAL ACCEPTANCE
 
 
 def test_plugin_budgets_vocab_and_hygiene():
-    # 1. plugin.json strict keys
+    # 1. plugin.json strict official Antigravity schema keys & types
     pjson = json.loads((ROOT_DIR / "plugin" / "director-work" / "plugin.json").read_text("utf-8"))
-    allowed = {"name", "description", "logo", "suggestedPrompts", "displayName", "version", "author", "homepage", "repository", "disabled"}
+    allowed = {
+        "$schema", "name", "displayName", "display_name", "description", "version", "disabled",
+        "logo", "suggestedPrompts", "suggested_prompts", "skills", "author", "homepage",
+        "repository", "license", "keywords", "extensions", "source", "sourcePath", "source_path",
+    }
     extra = set(pjson.keys()) - allowed
     assert not extra, f"disallowed plugin.json keys: {extra}"
+    assert isinstance(pjson.get("repository"), str), f"plugin.json repository must be string URL, got {type(pjson.get('repository')).__name__}"
     assert len(pjson.get("suggestedPrompts", [])) <= 3
 
     # 2. Subagent tools guard (prevent IDE unmapped tool hang bug)
@@ -861,6 +876,287 @@ def test_plugin_budgets_vocab_and_hygiene():
     return f"plugin strict, rules={rules_size}B, must-read={mr_sum}B, LF/JSON/PII clean"
 
 
+def test_director_protect_permission():
+    rules = TOOLS_DIR / "guard_rules.json"
+    with tempfile.TemporaryDirectory(prefix="agydw_prot_") as td:
+        tmp = pathlib.Path(td)
+        director = tmp / "DIRECTOR"
+        (director / "orders").mkdir(parents=True)
+        order_payload = {
+            "hookEventName": "PreToolUse",
+            "conversationId": "conv-prot-1",
+            "toolCall": {"name": "write_file", "args": {"Path": (director / "orders" / "WO-001.md").as_posix()}},
+        }
+        log_payload = {
+            "hookEventName": "PreToolUse",
+            "conversationId": "conv-prot-1",
+            "toolCall": {"name": "replace_file_content", "args": {"TargetFile": (director / "DIRECTOR_LOG.md").as_posix()}},
+        }
+        for label, payload in (("order", order_payload), ("log", log_payload)):
+            for mode in ("remind", "block"):
+                pw = run_py(TOOLS_DIR / "agy_guard.py", [
+                    "--rules", str(rules), "--profile", "worker", "--mode", mode, "--protect", str(director),
+                ], stdin_obj=payload, check_zero=True)
+                assert json.loads(pw.stdout).get("decision") == "deny", f"worker must deny {label} in {mode}: {pw.stdout}"
+
+                pd = run_py(TOOLS_DIR / "agy_guard.py", [
+                    "--rules", str(rules), "--profile", "director", "--mode", mode, "--protect", str(director),
+                ], stdin_obj=payload, check_zero=True)
+                assert json.loads(pd.stdout).get("decision") == "allow", f"director must allow {label} in {mode}: {pd.stdout}"
+    return "worker denied vs director allowed on orders/ and DIRECTOR_LOG.md"
+
+
+def test_merge_setup_and_honest_doctor():
+    with tempfile.TemporaryDirectory(prefix="agydw_merge_") as td:
+        tmp = pathlib.Path(td)
+        repo = tmp / "proj"
+        director = tmp / "DIRECTOR"
+        repo.mkdir()
+        run_cmd(["git", "init", "-b", "main", str(repo)], check_zero=True)
+        (repo / ".agents").mkdir()
+        custom_hooks = {
+            "user-custom-lint": {
+                "PreToolUse": [{"matcher": "run_command", "hooks": [{"type": "command", "command": "echo ok"}]}]
+            }
+        }
+        custom_plugins = {"entries": [{"path": (tmp / "other-plugin").as_posix()}]}
+        (repo / ".agents" / "hooks.json").write_text(json.dumps(custom_hooks, indent=2), encoding="utf-8", newline="\n")
+        (repo / ".agents" / "plugins.json").write_text(json.dumps(custom_plugins, indent=2), encoding="utf-8", newline="\n")
+
+        # Pre-populate valid DIRECTOR files manually so only missing .agents agydw wiring triggers failure
+        run_py(TOOLS_DIR / "agy_setup.py", [
+            "--repo", str(repo), "--director", str(director), "--rules", str(ROOT_DIR), "--init-director", "--apply",
+        ], check_zero=False)
+        # First test BEFORE agydw merge by restoring custom-only .agents files
+        (repo / ".agents" / "hooks.json").write_text(json.dumps(custom_hooks, indent=2), encoding="utf-8", newline="\n")
+        (repo / ".agents" / "plugins.json").write_text(json.dumps(custom_plugins, indent=2), encoding="utf-8", newline="\n")
+        (director / "DIRECTOR_STATE.md").write_text("# DIRECTOR_STATE\nPENDING_METHOD: ask_question + PO_PENDING.md\n", encoding="utf-8", newline="\n")
+        (director / "RESUME_STATE.md").write_text(
+            "PROGRESS: init\nDOING: merge test\nNEXT_STEP: verify\nCOMMS: NONE\n\nUPDATED: 2026-11-24 02:00 +08:00\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        # Before merge: --strict and doctor MUST fail and doctor must NOT say ENFORCED
+        sc_before = run_py(TOOLS_DIR / "agy_setup_check.py", ["--strict", str(director), "--repo", str(repo)])
+        assert sc_before.returncode == 1, f"setup_check --strict must fail without agydw hooks/plugins: {sc_before.stdout}"
+        doc_before = run_py(TOOLS_DIR / "agy_doctor.py", ["--repo", str(repo), "--json"])
+        db = json.loads(doc_before.stdout)
+        assert doc_before.returncode == 1 and db["counts"]["FAIL"] == 2 and "ENFORCED" not in db["counts"], (
+            f"doctor must fail without agydw wiring & never report ENFORCED: {doc_before.stdout}"
+        )
+
+        # Corrupted hooks JSON must cause agy_setup --apply to exit 1 (never falsely say DONE)
+        (repo / ".agents" / "hooks.json").write_text("{broken json", encoding="utf-8", newline="\n")
+        bad_setup = run_py(TOOLS_DIR / "agy_setup.py", ["--repo", str(repo), "--director", str(director), "--rules", str(ROOT_DIR), "--apply"])
+        assert bad_setup.returncode == 1 and "DONE" not in bad_setup.stdout, f"broken hooks must fail setup: {bad_setup.stdout}"
+
+        # Restore custom hooks and run non-destructive merge (NO --force)
+        (repo / ".agents" / "hooks.json").write_text(json.dumps(custom_hooks, indent=2), encoding="utf-8", newline="\n")
+        good_setup = run_py(TOOLS_DIR / "agy_setup.py", [
+            "--repo", str(repo), "--director", str(director), "--rules", str(ROOT_DIR), "--apply",
+        ], check_zero=True)
+        assert "MERGE " in good_setup.stdout, f"expected MERGE lines: {good_setup.stdout}"
+
+        merged_h = json.loads((repo / ".agents" / "hooks.json").read_text("utf-8"))
+        assert "user-custom-lint" in merged_h and "agydw-guard" in merged_h and "agydw-audit-and-bridge" in merged_h
+        merged_p = json.loads((repo / ".agents" / "plugins.json").read_text("utf-8"))
+        assert len(merged_p["entries"]) == 2 and merged_p["entries"][0]["path"].endswith("other-plugin")
+
+        # After merge: --strict passes & doctor reports CONFIGURED + HOOK_EXEC_OK with zero FAIL
+        run_py(TOOLS_DIR / "agy_setup_check.py", ["--strict", str(director), "--repo", str(repo)], check_zero=True)
+        doc_after = json.loads(run_py(TOOLS_DIR / "agy_doctor.py", [
+            "--repo", str(repo), "--plugin", str(ROOT_DIR / "plugin" / "director-work"), "--json",
+        ], check_zero=True).stdout)
+        assert doc_after["counts"]["FAIL"] == 0 and doc_after["counts"]["HOOK_EXEC_OK"] >= 1 and doc_after["counts"]["CONFIGURED"] == 2
+        assert "ENFORCED" not in doc_after["counts"]
+
+    return "non-destructive merge preserves custom .agents configs; doctor & setup_check honest"
+
+
+def test_standalone_plugin_and_official_schema():
+    payloads = json.loads((FIXTURES_DIR / "agy_hook_payloads.json").read_text("utf-8"))
+    ag = payloads["antigravity"]
+
+    with tempfile.TemporaryDirectory(prefix="agydw_iso_plugin_") as td:
+        tmp = pathlib.Path(td)
+        iso_plug = tmp / "standalone-plugin"
+        shutil.copytree(ROOT_DIR / "plugin" / "director-work", iso_plug)
+
+        # Ensure ../../tools does NOT exist around iso_plug
+        assert not (iso_plug.parent.parent / "tools").exists()
+
+        # Execute hooks.json command directly from isolated plugin folder via OS shell
+        ph_obj = json.loads((iso_plug / "hooks.json").read_text("utf-8"))
+        cmd_line = ph_obj["agydw-plugin-seatbelt"]["PreToolUse"][0]["hooks"][0]["command"]
+        p_deny = run_hook_shell(cmd_line, iso_plug, ag["g50_secret_read_app2"])
+        assert p_deny.returncode == 0 and json.loads(p_deny.stdout).get("decision") == "deny", f"standalone deny failed: {p_deny.stdout} {p_deny.stderr}"
+        p_g01 = run_hook_shell(cmd_line, iso_plug, ag["g01_force_push"])
+        assert p_g01.returncode == 0 and "[G01]" in json.loads(p_g01.stdout).get("reason", ""), f"standalone G01 failed: {p_g01.stdout}"
+        p_ok = run_hook_shell(cmd_line, iso_plug, ag["clean_cmd"])
+        assert p_ok.returncode == 0 and json.loads(p_ok.stdout).get("decision") == "allow", f"standalone allow failed: {p_ok.stdout}"
+
+        # Doctor validates official schema & executes standalone seatbelt hook
+        doc = json.loads(run_py(TOOLS_DIR / "agy_doctor.py", ["--plugin", str(iso_plug), "--json"], check_zero=True).stdout)
+        assert doc["counts"]["FAIL"] == 0 and doc["counts"]["HOOK_EXEC_OK"] == 1
+
+        # Mutate repository to dict (invalid per official schema) -> doctor MUST fail
+        pj = json.loads((iso_plug / "plugin.json").read_text("utf-8"))
+        pj["repository"] = {"type": "git", "url": "https://example.invalid/repo"}
+        (iso_plug / "plugin.json").write_text(json.dumps(pj), encoding="utf-8", newline="\n")
+        doc_bad = run_py(TOOLS_DIR / "agy_doctor.py", ["--plugin", str(iso_plug), "--json"])
+        assert doc_bad.returncode == 1 and "repository must be string" in doc_bad.stdout
+
+    return "standalone plugin seatbelt works without ../../tools + official JSON Schema type guard OK"
+
+
+def test_audit_unverified_and_arguments_compat():
+    with tempfile.TemporaryDirectory(prefix="agydw_honest_aud_") as td:
+        tmp = pathlib.Path(td)
+        audit_log = tmp / "hook.jsonl"
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+        ts_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # 1. PostToolUse without error & without transcript match -> MUST record status=unverified (never ok)
+        ha = run_py(TOOLS_DIR / "agy_audit.py", ["hook-append", "--log", str(audit_log)], stdin_obj={
+            "conversationId": "conv-unv",
+            "stepIdx": 999,
+            "toolCall": {"name": "run_command", "arguments": "{\"CommandLine\": \"git status\"}"},
+        }, check_zero=True)
+        assert json.loads(ha.stdout) == {}
+        entries = [json.loads(ln) for ln in audit_log.read_text("utf-8").splitlines() if ln.strip()]
+        assert entries[0]["result"]["status"] == "unverified", f"expected unverified, got {entries[0]}"
+        assert "git status" in entries[0]["input"], f"arguments JSON string lost: {entries[0]['input']}"
+
+        ver = run_py(TOOLS_DIR / "agy_audit.py", ["verify", "--log", str(audit_log)], check_zero=True)
+        assert "AGY_AUDIT_STATUS: chain=OK confirmed_ok=0 confirmed_error=0 unverified=1" in ver.stdout, ver.stdout
+
+        rep = tmp / "TASK_REPORT.md"
+        rep.write_text("# TASK REPORT\nSESSION_ID: conv-unv\nRAN:\n", encoding="utf-8")
+        run_py(TOOLS_DIR / "ran_line.py", ["--to", str(rep), "--exit", "0", "--cmd", "git status"], check_zero=True)
+        rva = run_py(TOOLS_DIR / "report_vs_audit.py", ["--report", str(rep), "--log", str(audit_log), "--session", "conv-unv"])
+        assert rva.returncode == 1 and "unverified" in rva.stdout, f"report_vs_audit must reject unverified log as PASS: rc={rva.returncode} {rva.stdout}"
+
+        # 2. agy_audit build on transcript using `arguments` JSON string field
+        tr = tmp / "tr_args.jsonl"
+        tr.write_text(
+            json.dumps({
+                "step_index": 0, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+                "created_at": ts_str, "model": "gemini-3-flash",
+                "tool_calls": [{"name": "run_command", "arguments": "{\"CommandLine\": \"git status\"}"}],
+            }) + "\n" +
+            json.dumps({
+                "step_index": 1, "source": "SYSTEM", "type": "GENERIC", "status": "DONE",
+                "created_at": ts_str, "content": "Command exited with code 0.\nnothing to commit",
+            }) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        rebuilt = tmp / "rebuilt.jsonl"
+        run_py(TOOLS_DIR / "agy_audit.py", ["build", "--transcript", str(tr), "--out", str(rebuilt), "--force"], check_zero=True)
+        r_entries = [json.loads(ln) for ln in rebuilt.read_text("utf-8").splitlines() if ln.strip()]
+        assert any("git status" in e.get("input", "") for e in r_entries), f"build missed arguments JSON string: {r_entries}"
+        v_rebuilt = run_py(TOOLS_DIR / "agy_audit.py", ["verify", "--log", str(rebuilt)], check_zero=True)
+        assert "confirmed_ok=1 confirmed_error=0 unverified=0" in v_rebuilt.stdout, v_rebuilt.stdout
+
+    return "unverified missing-output audit + arguments JSON-string rebuild OK"
+
+
+def test_docs_cli_and_test_request_template():
+    for rel in ("README.md", "BOOTSTRAP.md", "plugin/director-work/skills/dw-review-gate/SKILL.md"):
+        txt = (ROOT_DIR / rel).read_text("utf-8")
+        assert not re.search(r"evidence_record\.py\s+verify[^\n]*--evidence-dir", txt), f"broken --evidence-dir flag in {rel}"
+        assert "evidence_record.py verify" in txt and "--dispatch-log" in txt and "--candidate" in txt and "--rerun" in txt, (
+            f"missing full verify --rerun flags in {rel}"
+        )
+
+    # Validate TEST_REQUEST.md template fields directly with upstream gate_check.py --test-request
+    tr_raw = (ROOT_DIR / "templates" / "TEST_REQUEST.md").read_text("utf-8")
+    replacements = {
+        "<FUNC|BENCH> <內容> <上限分鐘>": "FUNC calc-suite 30",
+        "<worker 名稱與 conversationId>": "w1 (conv-1234)",
+        "<這次測試要回答哪一個決定或驗收項>": "Verify AC-1 after divide feature",
+        "<新產物或暫存資料夾的 GiB，沒有寫 0>": "0.5",
+        "<組數> x <每組張數> x <單張 MiB> = <GiB>（沒有擷取寫 NONE）": "NONE",
+        "<快取或重匯入餘量 GiB，沒有寫 0>": "0.5",
+        "<預計寫入的 GiB，至少 BUILD_GB + CAPTURE + CACHE_GB>": "1.0",
+        "<組數> x <單組實測分鐘（含逾時）> = <分鐘>": "1 x 10 = 10",
+    }
+    tr_filled = tr_raw
+    for k, v in replacements.items():
+        tr_filled = tr_filled.replace(k, v)
+    tr_filled = tr_filled.replace("TIER: 1 批次（預設） | 2 單項（寫理由：P0 / PO 在等 / 下一步依賴 / 耦合無法用開關分 / 單一根因驗證）", "TIER: 1 批次")
+    for placeholder, val in (
+        ("這次測試要回答哪一個決定或驗收項", "Verify AC-1"),
+        ("最小範圍，以及為什麼不能更小", "calc module only"),
+        ("這次修改包含的每一項變更，以及對應的開關", "add divide switch"),
+        ("要跑的開 / 關組合", "divide=on"),
+        ("每個開關、視角、輸出項的程式位置（檔案:行號，在要跑的 commit 裡）；計畫檔可交 run_plan_check.py 核對（2.6.0）", "calc.py:8"),
+        ("需要獨佔重資源／安靜時段的分鐘數（沒有寫 0）", "0"),
+        ("一般時段的分鐘數", "10"),
+        ("第 0 級（離線、純邏輯）檢查已做完的項目", "unittest passed"),
+    ):
+        tr_filled = tr_filled.replace(placeholder, val)
+
+    with tempfile.TemporaryDirectory(prefix="agydw_tr_") as td:
+        tr_path = pathlib.Path(td) / "TR-001.md"
+        tr_path.write_text(tr_filled, encoding="utf-8", newline="\n")
+        run_py(TOOLS_DIR / "gate_check.py", ["--test-request", str(tr_path)], check_zero=True)
+
+    return "README/BOOTSTRAP/SKILL verify --rerun flags + TEST_REQUEST.md gate_check OK"
+
+
+def test_incremental_transcript_perf():
+    import importlib.util
+    spec_b = importlib.util.spec_from_file_location("_test_bridge", TOOLS_DIR / "agy_hook_bridge.py")
+    mod_b = importlib.util.module_from_spec(spec_b)
+    spec_b.loader.exec_module(mod_b)
+    spec_a = importlib.util.spec_from_file_location("_test_aud", TOOLS_DIR / "agy_audit.py")
+    mod_a = importlib.util.module_from_spec(spec_a)
+    spec_a.loader.exec_module(mod_a)
+
+    with tempfile.TemporaryDirectory(prefix="agydw_perf_") as td:
+        tmp = pathlib.Path(td)
+        tp = tmp / "transcript.jsonl"
+        pad = "x" * 900
+        lines = []
+        for i in range(5200):
+            if i == 2500:
+                lines.append(json.dumps({"step_index": i, "type": "CHECKPOINT", "status": "DONE", "content": "compact"}))
+            else:
+                lines.append(json.dumps({"step_index": i, "type": "GENERIC", "status": "DONE", "content": pad}))
+        lines.append(json.dumps({
+            "step_index": 5200, "type": "GENERIC", "status": "DONE", "content": "tail sentinel step output ok",
+        }))
+        tp.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        size_mb = round(tp.stat().st_size / (1024 * 1024), 2)
+
+        t0 = time.perf_counter()
+        txt = mod_b.find_step_text(str(tp), 5200)
+        t_find_b = (time.perf_counter() - t0) * 1000.0
+        assert "tail sentinel step output ok" in txt
+
+        t1 = time.perf_counter()
+        cnt1, off1 = mod_b.count_checkpoints_incremental(str(tp), 0, 0)
+        t_cp1 = (time.perf_counter() - t1) * 1000.0
+        assert cnt1 == 1 and off1 == tp.stat().st_size
+
+        # Append one new CHECKPOINT and measure incremental delta scan
+        with open(tp, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps({"step_index": 5201, "type": "CHECKPOINT", "status": "DONE", "content": "compact2"}) + "\n")
+        t2 = time.perf_counter()
+        cnt2, off2 = mod_b.count_checkpoints_incremental(str(tp), cnt1, off1)
+        t_cp2 = (time.perf_counter() - t2) * 1000.0
+        assert cnt2 == 2 and off2 == tp.stat().st_size
+
+        t3 = time.perf_counter()
+        found, st_val, body = mod_a.find_step_in_transcript(str(tp), 5200)
+        t_find_a = (time.perf_counter() - t3) * 1000.0
+        assert found and st_val == "DONE" and "tail sentinel step output ok" in body
+
+    return f"{size_mb}MB transcript: tail_find={t_find_b:.1f}+{t_find_a:.1f}ms, cp_init={t_cp1:.1f}ms, cp_inc={t_cp2:.2f}ms"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--verbose", "-v", action="store_true", help="print every passing check")
@@ -872,9 +1168,15 @@ def main(argv=None):
     r.check("upstream_v2.6.0_byte_identity", lambda: test_upstream_identity(args.upstream))
     r.check("tools_help_smoke", test_tools_help)
     r.check("agy_guard_matrix", test_agy_guard_matrix)
+    r.check("director_protect_permission", test_director_protect_permission)
     r.check("hooks_cmd_quoting_and_spaces", test_hooks_cmd_quoting_and_spaces)
+    r.check("merge_setup_and_honest_doctor", test_merge_setup_and_honest_doctor)
+    r.check("standalone_plugin_and_official_schema", test_standalone_plugin_and_official_schema)
     r.check("agy_hook_bridge_flow", test_agy_hook_bridge_flow)
     r.check("agy_audit_and_usage", test_agy_audit_and_usage)
+    r.check("audit_unverified_and_arguments_compat", test_audit_unverified_and_arguments_compat)
+    r.check("docs_cli_and_test_request_template", test_docs_cli_and_test_request_template)
+    r.check("incremental_transcript_perf", test_incremental_transcript_perf)
     r.check("governance_tools_roundtrip", test_governance_tools_roundtrip)
     r.check("plugin_budgets_vocab_and_hygiene", test_plugin_budgets_vocab_and_hygiene)
 

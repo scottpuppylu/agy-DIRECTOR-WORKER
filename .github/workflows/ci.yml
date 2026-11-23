@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run full agydw self-test suite
+        run: python -B -I -X utf8 tools/selftest_agy.py --verbose
+      - name: Run agy_doctor against plugin and seatbelt hook
+        run: python -B -I -X utf8 tools/agy_doctor.py --plugin plugin/director-work --probe-hooks --json

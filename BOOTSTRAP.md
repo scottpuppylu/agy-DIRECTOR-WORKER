@@ -224,8 +224,8 @@ Antigravity 的全域開關位於使用者設定目錄（`~/.gemini/config/confi
 總監與 worker 收尾一律照以下紀律：
 1. **時間戳與 `RAN` 行禁止手填**：使用 `ran_line.py --stamp` 與 `ran_line.py --to <REPORT> -- <CMD>` 寫入精確結果與系統時間。
 2. **`WORKTREE` 行照工具輸出抄寫**：直接貼上 `scope_check.py` 或 `gate_check.py --report-skeleton` 印出的結果。
-3. **重跑 AUTO 條件**：總監用 `evidence_record.py verify --order <WO> --evidence-dir <EVID> --rerun` 親自重跑驗證，再跑 `gate_check.py --match` 與 `--verdict`。
-4. **重建稽核與用量**：執行 `agy_audit.py build --include-subagents` → `audit_log.py verify` → `report_vs_audit.py` 核對報告真實性，並跑 `agy_usage.py --project-dir <REPO> --include-subagents --loops --out <WS>/DIRECTOR/usage.json`。
+3. **重跑 AUTO 條件**：總監用 `evidence_record.py verify <EVID_JSON> --order <WO> --dispatch-log <WS>/DIRECTOR/DIRECTOR_LOG.md --repo <REPO> --candidate <HEAD> --rerun` 親自重跑驗證，再跑 `gate_check.py --match` 與 `--verdict`。
+4. **重建稽核與用量**：執行 `agy_audit.py build --transcript <TRANSCRIPT> --include-subagents --out <WS>/DIRECTOR/research/audit.jsonl --force` → `agy_audit.py verify --log <WS>/DIRECTOR/research/audit.jsonl` → `report_vs_audit.py --report <REPORT> --log <WS>/DIRECTOR/research/audit.jsonl` 核對報告真實性，並跑 `agy_usage.py --project-dir <REPO> --include-subagents --loops --out <WS>/DIRECTOR/usage.json`。
 5. **最終一致性檢查**：交最後報告與送交 PO 最終驗收前，執行：
    ```text
    python -B -I -X utf8 <RULES>/tools/gate_check.py --final <WS>/DIRECTOR --usage <WS>/DIRECTOR/usage.json

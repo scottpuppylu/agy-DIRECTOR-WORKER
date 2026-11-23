@@ -95,7 +95,13 @@ def translate_antigravity_call(payload, shell_opt="auto"):
     """Translate an Antigravity PreToolUse stdin payload into canonical hook_guard dict + metadata."""
     tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
     raw_name = tc.get("name") if isinstance(tc.get("name"), str) else ""
-    args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+    raw_args = tc.get("args") if tc.get("args") is not None else tc.get("arguments")
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except ValueError:
+            raw_args = {}
+    args = raw_args if isinstance(raw_args, dict) else {}
     ws = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
     cwd = first_str(args, "Cwd", "cwd") or (payload.get("cwd") if isinstance(payload.get("cwd"), str) else None) or (ws[0] if ws and isinstance(ws[0], str) else None)
     conv_id = payload.get("conversationId") if isinstance(payload.get("conversationId"), str) else None
@@ -268,7 +274,7 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     cwd = eval_call.get("cwd") if isinstance(eval_call.get("cwd"), str) else None
 
-    if a.protect and eval_call.get("tool_name") in ("Write", "Edit") and isinstance(file_path, str) and file_path:
+    if a.protect and hg.base_profile(profile) != "director" and eval_call.get("tool_name") in ("Write", "Edit") and isinstance(file_path, str) and file_path:
         why = hg.protected_reason(file_path, cwd, a.protect)
     elif isinstance(command, str):
         why = hg.reason(command, "powershell" if eval_call.get("tool_name") == "PowerShell" else "bash")
@@ -299,8 +305,8 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
             print(msg, file=sys.stderr)
             return 2
 
-    if a.protect and why and eval_call.get("tool_name") in ("Write", "Edit"):
-        # Protecting DIRECTOR/orders and DIRECTOR_LOG.md from worker writes is always hard-denied
+    if a.protect and hg.base_profile(profile) != "director" and why and eval_call.get("tool_name") in ("Write", "Edit"):
+        # Protecting DIRECTOR/orders and DIRECTOR_LOG.md from non-director writes is always hard-denied
         msg = f"BLOCKED by agy_guard [protect]: {why}"
         hg.audit(a.audit, canonical, "deny", "protect")
         if fmt == "antigravity":
@@ -378,14 +384,15 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
 
 
 def main(argv=None):
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rules", default=str(HERE / "guard_rules.json"), help="rules JSON file (default: sibling guard_rules.json)")
     ap.add_argument("--profile", choices=("worker", "director", "cleaner"), default="worker", help="guard profile (default: worker)")
     ap.add_argument("--mode", choices=("remind", "ask", "block"), default="remind", help="remind (default), ask (force_ask), or block (deny)")
     ap.add_argument("--format", choices=("auto", "antigravity", "claude"), default="auto", help="input/output hook protocol (default: auto)")
     ap.add_argument("--shell", choices=("auto", "powershell", "bash"), default="auto", help="shell syntax for run_command (default: auto by OS)")
-    ap.add_argument("--protect", action="append", default=[], help="DIRECTOR folder whose orders/ and DIRECTOR_LOG.md writes are denied")
+    ap.add_argument("--protect", action="append", default=[], help="DIRECTOR folder whose orders/ and DIRECTOR_LOG.md writes are denied for non-director profiles")
     ap.add_argument("--pause-flag", help="pause flag file (pause_ctl.py on|off)")
     ap.add_argument("--sessions", help="optional sessions map JSON")
     ap.add_argument("--audit", help="hash-chained action log file for decision lines")

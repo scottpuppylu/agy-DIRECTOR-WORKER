@@ -13,7 +13,7 @@ FALLBACK       = <同 conversationId 以 send_message 從 RESUME_STATE 接續 | 
 GOVERNANCE     = <Direct | Standard | Strict>
 BASE_REF       = <remote/branch @ commit，例：origin/main @ 1bfcb4a>   # 開工前先 git fetch，寫最新版本；落後時 gate_check --order 印 WARN BASE_REF（docs/02）
 NEW_BRANCH     = <分支名>
-WORKTREE       = <預設：invoke_subagent workspace="branch"（隔離 clone）或 git worktree add；多作者併行寫入可用 swarm workspace="share"；報告的 WORKTREE 行由 scope_check.py / gate_check.py 印出，不手填>
+WORKTREE       = <預設：invoke_subagent workspace="branch"（隔離 Git worktree）或 git worktree add；多作者併行可用 swarm workspace="share"；報告的 WORKTREE 行由 scope_check.py / gate_check.py 印出，不手填>
 WORK_DIR       = <放報告、PLAN.md、RESUME_STATE.md、證據與暫存輸出的資料夾>
 BUDGET         = <US$0 / 配額估計 | PO 核准的金額>
 HEAVY_RESOURCE = <無 | 需先 TEST REQUEST：類型、預估分鐘>

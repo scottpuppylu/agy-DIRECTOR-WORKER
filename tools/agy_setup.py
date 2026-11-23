@@ -153,7 +153,7 @@ def init_director(director_dir, rules_root, repo, apply, copy_tools):
     static_defaults = {
         "DIRECTOR_OPERATING_RULES.md": (
             f"# 本專案總監作業規則\n\n"
-            f"- 規則包版本：2.6.0-agy.1（位置：`{rules_root.as_posix()}`）\n"
+            f"- 規則包版本：2.6.0-agy.2（位置：`{rules_root.as_posix()}`）\n"
             f"- 本專案（`{repo.as_posix()}`）既有 `AGENTS.md` / `GEMINI.md` 與 PO 指示永遠優先。\n"
             f"- 其餘未列事項照 `{rules_root.as_posix()}/docs/` 01 至 13 執行。\n"
         ),
@@ -210,8 +210,60 @@ def init_director(director_dir, rules_root, repo, apply, copy_tools):
     return actions
 
 
+def _norm_path_key(path_str):
+    try:
+        return os.path.normcase(pathlib.Path(path_str).resolve().as_posix())
+    except (OSError, ValueError):
+        return os.path.normcase(str(path_str).replace("\\", "/"))
+
+
+def merge_hooks_config(hooks_file, hooks_obj):
+    """Non-destructively merge agydw hook groups into existing .agents/hooks.json."""
+    try:
+        existing = json.loads(hooks_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot parse existing {hooks_file.as_posix()}: {exc}") from exc
+    if not isinstance(existing, dict):
+        raise ValueError(f"existing {hooks_file.as_posix()} must be a JSON object, got {type(existing).__name__}")
+    if "hooks" in existing and isinstance(existing.get("hooks"), dict) and "agydw-guard" not in existing:
+        raise ValueError(f"existing {hooks_file.as_posix()} uses Claude-style 'hooks' wrapper; convert or pass --force")
+    preserved = [k for k in existing if k not in hooks_obj]
+    merged = dict(existing)
+    for k, v in hooks_obj.items():
+        merged[k] = v
+    changed = (merged != existing)
+    return merged, len(preserved), changed
+
+
+def merge_plugins_config(plugins_file, plugin_parent):
+    """Non-destructively append <RULES>/plugin entry to existing .agents/plugins.json."""
+    try:
+        existing = json.loads(plugins_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot parse existing {plugins_file.as_posix()}: {exc}") from exc
+    if not isinstance(existing, dict):
+        raise ValueError(f"existing {plugins_file.as_posix()} must be a JSON object, got {type(existing).__name__}")
+    entries = existing.get("entries", [])
+    if not isinstance(entries, list):
+        raise ValueError(f"existing {plugins_file.as_posix()} 'entries' must be a JSON array")
+
+    target_str = pathlib.Path(plugin_parent).resolve().as_posix()
+    want_keys = {_norm_path_key(target_str), _norm_path_key(pathlib.Path(plugin_parent) / "director-work")}
+    already = any(
+        isinstance(e, dict) and isinstance(e.get("path"), str) and _norm_path_key(e["path"]) in want_keys
+        for e in entries
+    )
+    merged = dict(existing)
+    merged_entries = list(entries)
+    if not already:
+        merged_entries.append({"path": target_str})
+    merged["entries"] = merged_entries
+    return merged, len(entries), (not already)
+
+
 def main(argv=None):
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", required=True, help="target project git repository")
     ap.add_argument("--director", help="DIRECTOR folder path (default: <REPO>/../DIRECTOR)")
@@ -226,7 +278,7 @@ def main(argv=None):
     ap.add_argument("--overwrite-utf8", action="store_true", help="opt-in PreToolUse overwrite for python -I -X utf8")
     ap.add_argument("--init-director", action="store_true", help="scaffold missing DIRECTOR/ files from templates")
     ap.add_argument("--no-copy-tools", action="store_true", help="do not copy tools/ into DIRECTOR/ during --init-director")
-    ap.add_argument("--force", action="store_true", help="overwrite existing .agents/hooks.json / plugins.json")
+    ap.add_argument("--force", action="store_true", help="replace whole .agents/hooks.json / plugins.json instead of merging")
     ap.add_argument("--apply", action="store_true", help="write files (default: dry-run)")
     try:
         a = ap.parse_args(argv)
@@ -265,7 +317,7 @@ def main(argv=None):
     if a.init_director:
         actions += init_director(director_dir, rules_root, repo, a.apply, not a.no_copy_tools)
 
-    # 3. .agents/hooks.json
+    # 3. .agents/hooks.json (non-destructive merge when existing unless --force)
     agents_dir = repo / ".agents"
     hooks_file = agents_dir / "hooks.json"
     hooks_obj = build_hooks_config(a, rules_root, director_dir if (a.director or a.init_director or director_dir.is_dir()) else None)
@@ -275,9 +327,19 @@ def main(argv=None):
             agents_dir.mkdir(parents=True, exist_ok=True)
             hooks_file.write_text(json.dumps(hooks_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
     else:
-        actions.append(f"KEEP {hooks_file.as_posix()} (exists; pass --force to replace)")
+        try:
+            merged_hooks, n_preserved, changed = merge_hooks_config(hooks_file, hooks_obj)
+        except ValueError as exc:
+            print(f"AGY_SETUP: FAIL {exc}", file=sys.stderr)
+            return 1
+        if changed:
+            actions.append(f"MERGE {hooks_file.as_posix()} (preserved {n_preserved} existing group(s))")
+            if a.apply:
+                hooks_file.write_text(json.dumps(merged_hooks, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+        else:
+            actions.append(f"OK {hooks_file.as_posix()} (already up to date; preserved {n_preserved} existing group(s))")
 
-    # 4. .agents/plugins.json
+    # 4. .agents/plugins.json (non-destructive merge when existing unless --force)
     plugins_file = agents_dir / "plugins.json"
     if plugin_parent.is_dir():
         plugins_obj = build_plugins_config(plugin_parent)
@@ -287,7 +349,17 @@ def main(argv=None):
                 agents_dir.mkdir(parents=True, exist_ok=True)
                 plugins_file.write_text(json.dumps(plugins_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
         else:
-            actions.append(f"KEEP {plugins_file.as_posix()} (exists; pass --force to replace)")
+            try:
+                merged_plugins, n_entries, changed = merge_plugins_config(plugins_file, plugin_parent)
+            except ValueError as exc:
+                print(f"AGY_SETUP: FAIL {exc}", file=sys.stderr)
+                return 1
+            if changed:
+                actions.append(f"MERGE {plugins_file.as_posix()} -> {plugin_parent.as_posix()} (preserved {n_entries} existing entry/entries)")
+                if a.apply:
+                    plugins_file.write_text(json.dumps(merged_plugins, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+            else:
+                actions.append(f"OK {plugins_file.as_posix()} (already registered; preserved {n_entries} existing entry/entries)")
 
     for act in actions:
         print(("APPLY " if a.apply else "PLAN  ") + act)

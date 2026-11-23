@@ -1,6 +1,6 @@
 # ANTIGRAVITY-PORT — `DIRECTOR-WORK v2.6.0` 到 Antigravity 的設計對照與實證紀錄
 
-本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.1`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的原生平台能力轉化為實質治理優勢。
+本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.2`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的原生平台能力轉化為實質治理優勢。
 
 ---
 
@@ -31,15 +31,16 @@
 2. **Windows `cmd /c` 執行 Hook 的雙引號剝除陷阱**：
    - Windows 上 Antigravity 透過 `cmd /c <command>` 執行 Hook，作業系統的工作目錄預設為 `hooks.json` 所在資料夾。
    - 若指令字串以 `"` 開頭**且**以 `"` 結尾（例如 `"C:\...\python.exe" -I -X utf8 "D:\...\script.py"`），`cmd /c` 會先剝除最外層一對引號，導致內部引號全部錯位失敗。
-   - 解法：`plugin/director-work/hooks.json` 採用無空白相對路徑 `python -I -X utf8 ../../tools/agy_guard.py ...`；`agy_setup.py` 僅在路徑含空白或特殊字元時加引號，且當第一段（`python.exe`）被加引號時於最前方自動加上 `call `，並納入 `agy_doctor.py --probe-hooks` 與 `selftest_agy.py` 實測回歸驗證。
+   - 解法：`plugin/director-work/hooks.json` 呼叫自備的 `scripts/seatbelt_hook.py --profile worker --mode remind`（外掛可獨立複製執行；若偵測到完整 `DIRECTOR/tools/` 或 repo `tools/` 則委派給 `agy_guard.py`）；`agy_setup.py` 僅在路徑含空白或特殊字元時加引號，且當第一段（`python.exe`）被加引號時於最前方自動加上 `call `，並透過 `-B` 防止產生 `__pycache__`，納入 `agy_doctor.py` 與 `selftest_agy.py` 實測回歸驗證。
 3. **`transcript.jsonl` Token 與事件語意**：
    - 對話紀錄位於 `<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`（必要時對應完整欄位檔 `transcript_full.jsonl`）。
    - 經實測 `PLANNER_RESPONSE` 的 token 欄位語意為：`input_tokens` = 未快取輸入 token；`cache_read_tokens` = Prompt Cache 命中 token；`output_tokens` = 輸出（含思考）token；因此**該回合實際總上下文大小 = `input_tokens + cache_read_tokens`**。
-   - 工具呼叫的 `tool_calls[].arguments` 在紀錄中可能為 JSON 編碼字串，解析時需再解碼；緊隨在後的 `GENERIC` 步驟記錄工具輸出。失敗的 `run_command` 在紀錄上 `status` 仍為 `"DONE"`，但 `content` 會包含 `Command exited with code N.`（`N != 0`）。壓縮事件會寫入 `type="CHECKPOINT"`。`invoke_subagent` 成功後回傳 JSON 含 `"conversationId": "<uuid>"`。
+   - 工具呼叫的參數欄位在實際工具支援 `tool_calls[].args` 與 `tool_calls[].arguments` 兩種格式（含 JSON 編碼字串）；緊隨在後的 `GENERIC` 步驟記錄工具輸出。失敗的 `run_command` 在紀錄上 `status` 仍為 `"DONE"`，但 `content` 會包含 `Command exited with code N.`（`N != 0`）。壓縮事件會寫入 `type="CHECKPOINT"`。`invoke_subagent` 成功後回傳 JSON 含 `"conversationId": "<uuid>"`。
+   - `agy_audit.py` 與 `agy_hook_bridge.py` 採尾端分塊預篩與 `compaction_<cid>.json` 位元偏移量增量游標讀取，避免長對話在每次 Hook 重讀整份檔案；當 `hook-append` 無法看到工具輸出時一律記為 `status: "unverified"`，不假寫 `ok`。
 4. **規則與外掛限制**：
    - 單一規則檔案硬上限 **24,000 bytes**；系統提示詞總預算為 20,000 tokens。本外掛 `plugin/director-work/rules/AGENTS.md` 控制在 ~4 KB（`< 8,500` B），且四份每輪必讀文件合計 `<= 9,550` B。
-   - `plugin.json` 僅允許嚴格頂層欄位（`name`、`description`、`logo`、`suggestedPrompts` 上限 3 筆等），`rules/AGENTS.md` 不帶 YAML frontmatter。
-   - **絕不編輯使用者全域 `~/.gemini/config/config.json`**；專案掛載透過專案內 `.agents/plugins.json`。
+   - `plugin.json` 須嚴格符合官方 Schema（`https://antigravity.google/schemas/v1/plugin.json`：`repository` 為**字串 URL**，錯誤型別會導致載入失敗），`rules/AGENTS.md` 不帶 YAML frontmatter。
+   - **絕不編輯使用者全域 `~/.gemini/config/config.json`**；專案掛載透過專案內 `.agents/plugins.json` 非破壞性合併。
 5. **自訂子代理 YAML `tools:` 防掛死守則**：
    - Antigravity 2.0 若在子代理 `.md` 的 YAML `tools:` 欄誤寫未映射或舊版工具名（如 `view_file`、`grep_search`），啟動後可能無限等待；應使用明確有效的核心工具名（如 `dw-blind-reviewer.md` 僅列 `[read_file]`）。
 6. **OS 原生沙箱（無須 Docker）**：
@@ -88,8 +89,8 @@
 ## 6. 外掛、模板與 Workflow 編排設計
 
 - **Plugin 結構 (`plugin/director-work/`)**：
-  - `plugin.json`：遵循嚴格頂層 schema，附 3 條繁體中文建議啟動詞。
-  - `hooks.json`：無需手動編修路徑即可啟動 `PreToolUse` 基本安全帶（跨 OS 相對路徑設計）。
+  - `plugin.json`：對齊官方 `https://antigravity.google/schemas/v1/plugin.json`（含字串 `repository` 與 `$schema`），附 3 條繁體中文建議啟動詞。
+  - `hooks.json` ＋ `scripts/seatbelt_hook.py`：外掛獨立複製時仍可開箱攔截憑證讀取與 `G00`/`G01`/`G02`，若存在 `DIRECTOR/tools/` 或 repo `tools/` 則委派完整 `agy_guard.py`。
   - `skills/`（5 個按需技能）：`dw-bootstrap`、`dw-dispatch`、`dw-review-gate`、`dw-resume`、`dw-release`。
   - `agents/`（3 個專屬子代理）：`dw-worker.md`（寫作施工）、`dw-blind-reviewer.md`（唯讀 `tools: [read_file]`）、`dw-visual-qa.md`（強調 `BROWSER_HOST_FACTS` 與跨畫面比較）。
 - **Workflow Fan-Out 範本 (`templates/workflows/`)**：

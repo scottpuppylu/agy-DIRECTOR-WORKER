@@ -43,7 +43,13 @@ KNOWN_GOOD_AGENT_TOOLS = {
     "swarm", "post_message", "read_board", "swarm_wait",
 }
 HANG_RISK_AGENT_TOOLS = {"view_file", "write_to_file", "replace_file_content", "multi_replace_file_content", "grep_search", "find_by_name"}
-ALLOWED_PLUGIN_FIELDS = {"name", "description", "logo", "suggestedPrompts", "displayName", "version", "author", "homepage", "repository", "disabled"}
+ALLOWED_PLUGIN_FIELDS = {
+    "$schema", "name", "displayName", "display_name", "description", "version", "disabled",
+    "logo", "suggestedPrompts", "suggested_prompts", "skills", "author", "homepage",
+    "repository", "license", "keywords", "extensions", "source", "sourcePath", "source_path",
+}
+PLUGIN_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+NON_WS_RE = re.compile(r"\S")
 
 
 def check_item(name, status, detail):
@@ -76,57 +82,213 @@ def check_os_sandbox():
                       "Linux user namespaces available" if ns_ok else "/proc/self/ns/user missing")
 
 
+def _run_shell_hook(cmd_line, cwd_dir, payload):
+    """Invoke a configured hook command identically to Antigravity on the host OS."""
+    inp = json.dumps(payload, ensure_ascii=False)
+    try:
+        if os.name == "nt":
+            return subprocess.run(
+                "cmd /d /c " + cmd_line,
+                cwd=str(cwd_dir),
+                input=inp,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+        return subprocess.run(
+            ["sh", "-c", cmd_line],
+            cwd=str(cwd_dir),
+            input=inp,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return exc
+
+
+def _probe_pretool_command(check_name, cmd_line, cwd_dir, mode="remind"):
+    """Live-execute an extracted PreToolUse hook command against deny/allow/G01 cases."""
+    cases = [
+        ("deny_env_read", {"toolCall": {"name": "read_file", "args": {"Path": ".env"}}, "hookEventName": "PreToolUse"}, "deny", None),
+        ("allow_status", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}, "hookEventName": "PreToolUse"}, "allow", None),
+    ]
+    g01_expected = "deny" if mode == "block" else ("force_ask" if mode == "ask" else "allow")
+    g01_substr = "[G01]" if mode != "block" else None
+    cases.append(
+        ("g01_force_push", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git push --force origin main"}}, "hookEventName": "PreToolUse"}, g01_expected, g01_substr)
+    )
+    for cname, payload, expected_dec, want_substr in cases:
+        proc = _run_shell_hook(cmd_line, cwd_dir, payload)
+        if isinstance(proc, Exception):
+            return check_item(check_name, "FAIL", f"{cname}: hook execution failed: {proc}")
+        try:
+            res = json.loads(proc.stdout.strip())
+            got = res.get("decision")
+            reason = str(res.get("reason") or "")
+        except ValueError:
+            got, reason = None, ""
+        if proc.returncode != 0 or got != expected_dec or (want_substr and want_substr not in reason):
+            return check_item(
+                check_name,
+                "FAIL",
+                f"{cname}: expected decision={expected_dec!r}" + (f" reason~={want_substr!r}" if want_substr else "")
+                + f" rc=0, got decision={got!r} reason={reason!r} rc={proc.returncode} stderr={proc.stderr.strip()[:120]}",
+            )
+    return check_item(
+        check_name,
+        "HOOK_EXEC_OK",
+        f"executed `{cmd_line[:60]}{'...' if len(cmd_line) > 60 else ''}` passed 3/3 (.env=deny, git status=allow, force-push {mode}={g01_expected}; live runtime firing verified separately via audit log)",
+    )
+
+
+def _extract_pretool_command(hooks_obj, preferred_group=None):
+    """Return first PreToolUse hook command string from an Antigravity hooks.json dict."""
+    if not isinstance(hooks_obj, dict):
+        return None
+    groups = [preferred_group] if (preferred_group and preferred_group in hooks_obj) else list(hooks_obj.keys())
+    for gname in groups:
+        grp = hooks_obj.get(gname)
+        if not isinstance(grp, dict):
+            continue
+        for entry in grp.get("PreToolUse") or []:
+            if isinstance(entry, dict):
+                for hk in entry.get("hooks") or []:
+                    if isinstance(hk, dict) and isinstance(hk.get("command"), str) and hk["command"].strip():
+                        return hk["command"].strip()
+    return None
+
+
 def check_hooks_and_probe(repo, probe_hooks):
-    """Validate .agents/hooks.json (if present) and live-probe agy_guard.py."""
+    """Validate .agents/hooks.json, .agents/plugins.json, and live-execute configured hook commands."""
     items = []
-    hooks_path = pathlib.Path(repo) / ".agents" / "hooks.json" if repo else None
-    if hooks_path:
+    ran_workspace_exec = False
+    if repo:
+        rp = pathlib.Path(repo)
+        hooks_path = rp / ".agents" / "hooks.json"
         if hooks_path.is_file():
             try:
                 data = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
-                if isinstance(data, dict) and data:
-                    items.append(check_item("workspace_hooks", "ENFORCED", f"{hooks_path.as_posix()} valid JSON ({len(data)} hook group(s))"))
+                if not isinstance(data, dict):
+                    items.append(check_item("workspace_hooks_config", "FAIL", f"{hooks_path.as_posix()} must be a JSON object"))
                 else:
-                    items.append(check_item("workspace_hooks", "WARN", f"{hooks_path.as_posix()} is empty"))
+                    guard_grp = data.get("agydw-guard")
+                    bridge_grp = data.get("agydw-audit-and-bridge")
+                    has_guard = isinstance(guard_grp, dict) and bool(_extract_pretool_command({"agydw-guard": guard_grp}, "agydw-guard"))
+                    has_bridge = isinstance(bridge_grp, dict) and isinstance(bridge_grp.get("PostToolUse"), list)
+                    if has_guard and has_bridge:
+                        items.append(check_item("workspace_hooks_config", "CONFIGURED", f"{hooks_path.as_posix()} configured with agydw-guard + agydw-audit-and-bridge ({len(data)} total group(s))"))
+                        cmd_line = _extract_pretool_command(data, "agydw-guard")
+                        m_mode = re.search(r"--mode\s+(remind|ask|block)\b", cmd_line or "")
+                        mode = m_mode.group(1) if m_mode else "remind"
+                        items.append(_probe_pretool_command("workspace_hook_exec", cmd_line, hooks_path.parent, mode=mode))
+                        ran_workspace_exec = True
+                    else:
+                        missing = [n for n, ok in (("agydw-guard", has_guard), ("agydw-audit-and-bridge", has_bridge)) if not ok]
+                        items.append(check_item("workspace_hooks_config", "FAIL", f"{hooks_path.as_posix()} missing agydw group(s): {', '.join(missing)} (run agy_setup.py --apply)"))
             except (OSError, ValueError) as exc:
-                items.append(check_item("workspace_hooks", "FAIL", f"{hooks_path.as_posix()} invalid JSON: {exc}"))
+                items.append(check_item("workspace_hooks_config", "FAIL", f"{hooks_path.as_posix()} invalid JSON: {exc}"))
         else:
-            items.append(check_item("workspace_hooks", "MISSING", f"{hooks_path.as_posix()} not found (run agy_setup.py --apply)"))
+            items.append(check_item("workspace_hooks_config", "MISSING", f"{hooks_path.as_posix()} not found (run agy_setup.py --apply)"))
 
-    if probe_hooks or (hooks_path and hooks_path.is_file()):
+        plug_cfg = rp / ".agents" / "plugins.json"
+        if plug_cfg.is_file():
+            try:
+                pdata = json.loads(plug_cfg.read_text(encoding="utf-8-sig"))
+                entries = pdata.get("entries") if isinstance(pdata, dict) else None
+                if not isinstance(entries, list):
+                    items.append(check_item("workspace_plugins_config", "FAIL", f"{plug_cfg.as_posix()} missing 'entries' list"))
+                else:
+                    matched = None
+                    for ent in entries:
+                        if isinstance(ent, dict) and isinstance(ent.get("path"), str):
+                            ep = pathlib.Path(ent["path"])
+                            if not ep.is_absolute():
+                                ep = (rp / ep).resolve()
+                            if (ep / "director-work" / "plugin.json").is_file() or (ep.name == "director-work" and (ep / "plugin.json").is_file()):
+                                matched = ep
+                                break
+                    if matched:
+                        items.append(check_item("workspace_plugins_config", "CONFIGURED", f"{plug_cfg.as_posix()} registers director-work ({matched.as_posix()})"))
+                    else:
+                        items.append(check_item("workspace_plugins_config", "FAIL", f"{plug_cfg.as_posix()} has {len(entries)} entry/entries but none registers director-work (run agy_setup.py --apply)"))
+            except (OSError, ValueError) as exc:
+                items.append(check_item("workspace_plugins_config", "FAIL", f"{plug_cfg.as_posix()} invalid JSON: {exc}"))
+        else:
+            items.append(check_item("workspace_plugins_config", "MISSING", f"{plug_cfg.as_posix()} not found (run agy_setup.py --apply)"))
+
+    if probe_hooks and not ran_workspace_exec:
         guard = HERE / "agy_guard.py"
         rules = HERE / "guard_rules.json"
         if not guard.is_file() or not rules.is_file():
             items.append(check_item("guard_probe", "FAIL", "agy_guard.py or guard_rules.json missing"))
             return items
-        cases = [
-            ("deny_force_push", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git push --force origin main"}}, "hookEventName": "PreToolUse"}, "deny"),
-            ("allow_status", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}, "hookEventName": "PreToolUse"}, "allow"),
-            ("deny_env_read", {"toolCall": {"name": "read_file", "args": {"Path": ".env"}}, "hookEventName": "PreToolUse"}, "deny"),
-        ]
-        for cname, payload, expected in cases:
-            proc = subprocess.run(
-                [sys.executable, "-B", "-I", "-X", "utf8", str(guard), "--rules", str(rules), "--profile", "worker", "--mode", "block"],
-                input=json.dumps(payload),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-            try:
-                res = json.loads(proc.stdout.strip())
-                got = res.get("decision")
-            except ValueError:
-                got = None
-            if proc.returncode == 0 and got == expected:
-                continue
-            items.append(check_item("guard_probe", "FAIL", f"{cname}: expected {expected} (rc=0), got {got!r} (rc={proc.returncode})"))
-            return items
-        items.append(check_item("guard_probe", "ENFORCED", "agy_guard.py live probe passed 3/3 (force push=deny, .env read=deny, git status=allow)"))
+        py_q = f'"{sys.executable}"' if re.search(r"\s", sys.executable) else sys.executable
+        if os.name == "nt" and py_q.startswith('"'):
+            py_q = f"call {py_q}"
+        g_q = f'"{guard.as_posix()}"' if re.search(r"\s", guard.as_posix()) else guard.as_posix()
+        r_q = f'"{rules.as_posix()}"' if re.search(r"\s", rules.as_posix()) else rules.as_posix()
+        cmd = f"{py_q} -B -I -X utf8 {g_q} --rules {r_q} --profile worker --mode block"
+        items.append(_probe_pretool_command("guard_probe", cmd, HERE, mode="block"))
     return items
 
 
+def validate_plugin_manifest(mdata):
+    """Validate plugin.json against https://antigravity.google/schemas/v1/plugin.json types."""
+    if not isinstance(mdata, dict):
+        return ["plugin.json root must be a JSON object"]
+    errs = []
+    extra = sorted(set(mdata) - ALLOWED_PLUGIN_FIELDS)
+    if extra:
+        errs.append(f"unknown keys dropped by loader: {extra}")
+    name = mdata.get("name")
+    if not isinstance(name, str) or not PLUGIN_NAME_RE.fullmatch(name):
+        errs.append("name must be a string matching ^[a-zA-Z0-9_-]+$")
+    for sk in ("$schema", "displayName", "display_name", "description", "version", "homepage", "repository", "license", "logo", "source", "sourcePath", "source_path"):
+        if sk in mdata and not isinstance(mdata[sk], str):
+            errs.append(f"{sk} must be string (got {type(mdata[sk]).__name__})")
+    if "disabled" in mdata and not isinstance(mdata["disabled"], bool):
+        errs.append(f"disabled must be boolean (got {type(mdata['disabled']).__name__})")
+    for pk in ("suggestedPrompts", "suggested_prompts"):
+        if pk in mdata:
+            val = mdata[pk]
+            if not isinstance(val, list) or len(val) > 3 or not all(isinstance(x, str) and NON_WS_RE.search(x) for x in val):
+                errs.append(f"{pk} must be array of <=3 non-blank strings")
+    if "skills" in mdata:
+        sv = mdata["skills"]
+        ok_s = (isinstance(sv, str) and bool(NON_WS_RE.search(sv))) or (
+            isinstance(sv, list) and all(isinstance(x, str) and bool(NON_WS_RE.search(x)) for x in sv)
+        )
+        if not ok_s:
+            errs.append("skills must be non-blank string or array of non-blank strings")
+    if "author" in mdata:
+        av = mdata["author"]
+        if isinstance(av, dict):
+            extra_a = sorted(set(av) - {"name", "email", "url"})
+            if extra_a:
+                errs.append(f"author object has unknown keys: {extra_a}")
+            for ak, val in av.items():
+                if not isinstance(val, str):
+                    errs.append(f"author.{ak} must be string")
+        elif not isinstance(av, str):
+            errs.append(f"author must be string or object (got {type(av).__name__})")
+    if "keywords" in mdata:
+        kv = mdata["keywords"]
+        if not isinstance(kv, list) or not all(isinstance(x, str) for x in kv):
+            errs.append("keywords must be array of strings")
+    if "extensions" in mdata:
+        ev = mdata["extensions"]
+        if not isinstance(ev, dict) or not all(isinstance(v, dict) for v in ev.values()):
+            errs.append("extensions must be object of objects")
+    return errs
+
+
 def check_plugin_dir(plugin_dir):
-    """Validate an Antigravity plugin folder (manifest, AGENTS.md <= 24KB, skills, agent tool names)."""
+    """Validate an Antigravity plugin folder (manifest types, hooks exec, AGENTS.md <= 24KB, skills, agents)."""
     items = []
     pdir = pathlib.Path(plugin_dir)
     manifest = pdir / "plugin.json"
@@ -136,13 +298,25 @@ def check_plugin_dir(plugin_dir):
         mdata = json.loads(manifest.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         return [check_item("plugin", "FAIL", f"invalid {manifest.name}: {exc}")]
-    extra = sorted(set(mdata) - ALLOWED_PLUGIN_FIELDS)
-    if extra:
-        items.append(check_item("plugin_manifest", "FAIL", f"unknown plugin.json keys dropped by loader: {extra}"))
-    elif not mdata.get("name"):
-        items.append(check_item("plugin_manifest", "FAIL", "plugin.json missing name"))
+
+    m_errs = validate_plugin_manifest(mdata)
+    if m_errs:
+        items.append(check_item("plugin_manifest", "FAIL", "; ".join(m_errs)))
     else:
-        items.append(check_item("plugin_manifest", "OK", f"plugin `{mdata['name']}` valid ({len(mdata.get('suggestedPrompts') or [])} starter prompts)"))
+        items.append(check_item("plugin_manifest", "OK", f"plugin `{mdata['name']}` schema-valid ({len(mdata.get('suggestedPrompts') or [])} starter prompts)"))
+
+    phooks = pdir / "hooks.json"
+    if phooks.is_file():
+        try:
+            ph_obj = json.loads(phooks.read_text(encoding="utf-8-sig"))
+            pcmd = _extract_pretool_command(ph_obj)
+            if not pcmd:
+                items.append(check_item("plugin_hooks_exec", "FAIL", f"{phooks.name}: missing PreToolUse command"))
+            else:
+                m_mode = re.search(r"--mode\s+(remind|ask|block)\b", pcmd)
+                items.append(_probe_pretool_command("plugin_hooks_exec", pcmd, pdir, mode=(m_mode.group(1) if m_mode else "remind")))
+        except (OSError, ValueError) as exc:
+            items.append(check_item("plugin_hooks_exec", "FAIL", f"{phooks.name}: invalid JSON: {exc}"))
 
     rules_file = pdir / "rules" / "AGENTS.md"
     if rules_file.is_file():
@@ -227,7 +401,8 @@ def check_licenses(path_str, warn_days):
 
 
 def main(argv=None):
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", help="target project git repository to inspect")
     ap.add_argument("--plugin", help="plugin directory to validate (default: ../plugin/director-work if present)")
@@ -333,7 +508,7 @@ def main(argv=None):
         items += litems
 
     counts = {s: sum(1 for it in items if it["status"] == s)
-              for s in ("OK", "ENFORCED", "CONFIGURED_NOT_VERIFIED", "NOT_ENFORCED", "MISSING", "WARN", "FAIL", "INFO")}
+              for s in ("OK", "HOOK_EXEC_OK", "CONFIGURED", "CONFIGURED_NOT_VERIFIED", "NOT_ENFORCED", "MISSING", "WARN", "FAIL", "INFO")}
     summary = {"status": "FAIL" if counts["FAIL"] else "OK", "counts": counts, "checks": items}
 
     if a.json:
@@ -341,8 +516,9 @@ def main(argv=None):
     else:
         for it in items:
             print(f"{it['status']:24s} {it['name']}: {it['detail']}")
-        print(f"DOCTOR_AGY: ok={counts['OK'] + counts['ENFORCED']} warn={counts['WARN'] + counts['NOT_ENFORCED'] + counts['MISSING']} "
-              f"not_verified={counts['CONFIGURED_NOT_VERIFIED']} fail={counts['FAIL']}")
+        ok_total = counts["OK"] + counts["HOOK_EXEC_OK"] + counts["CONFIGURED"]
+        warn_total = counts["WARN"] + counts["NOT_ENFORCED"] + counts["MISSING"]
+        print(f"DOCTOR_AGY: ok={ok_total} warn={warn_total} not_verified={counts['CONFIGURED_NOT_VERIFIED']} fail={counts['FAIL']}")
     return 1 if counts["FAIL"] else 0
 
 

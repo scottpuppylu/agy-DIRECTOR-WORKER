@@ -175,7 +175,8 @@ def effort_check(order_path, sessions):
 
 
 def main(argv=None):
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--brain-root", action="append", default=[], help="override Antigravity brain directory (repeatable)")
     ap.add_argument("--transcript", action="append", default=[], help="transcript.jsonl file (repeatable)")

@@ -135,21 +135,63 @@ def check_director(dpath, repo_path=None):
 
     if repo_path:
         rp = pathlib.Path(repo_path)
-        for rel in (".agents/hooks.json", ".agents/plugins.json"):
-            fp = rp / rel
-            if not fp.is_file():
-                shadows.append(f"workspace missing {rel} (run agy_setup.py --apply)")
-            else:
-                try:
-                    json.loads(fp.read_text(encoding="utf-8-sig"))
-                except (OSError, ValueError) as exc:
-                    problems.append(f"{rel} invalid JSON: {exc}")
+        hooks_fp = rp / ".agents" / "hooks.json"
+        if not hooks_fp.is_file():
+            shadows.append("workspace missing .agents/hooks.json (run agy_setup.py --apply)")
+        else:
+            try:
+                hdata = json.loads(hooks_fp.read_text(encoding="utf-8-sig"))
+                if not isinstance(hdata, dict):
+                    problems.append(".agents/hooks.json must be a JSON object")
+                else:
+                    guard_grp = hdata.get("agydw-guard")
+                    bridge_grp = hdata.get("agydw-audit-and-bridge")
+                    if not isinstance(guard_grp, dict) or not guard_grp.get("PreToolUse"):
+                        shadows.append(".agents/hooks.json missing 'agydw-guard' PreToolUse group (run agy_setup.py --apply)")
+                    else:
+                        g_cmds = [h.get("command", "") for blk in (guard_grp.get("PreToolUse") or []) if isinstance(blk, dict) for h in (blk.get("hooks") or []) if isinstance(h, dict)]
+                        if not any("agy_guard.py" in c for c in g_cmds):
+                            shadows.append(".agents/hooks.json 'agydw-guard' does not invoke agy_guard.py")
+                    if not isinstance(bridge_grp, dict) or not bridge_grp.get("PostToolUse"):
+                        shadows.append(".agents/hooks.json missing 'agydw-audit-and-bridge' PostToolUse group (run agy_setup.py --apply)")
+                    else:
+                        b_cmds = [h.get("command", "") for blk in (bridge_grp.get("PostToolUse") or []) if isinstance(blk, dict) for h in (blk.get("hooks") or []) if isinstance(h, dict)]
+                        if not (any("agy_audit.py" in c for c in b_cmds) and any("agy_hook_bridge.py" in c for c in b_cmds)):
+                            shadows.append(".agents/hooks.json 'agydw-audit-and-bridge' missing agy_audit.py / agy_hook_bridge.py")
+            except (OSError, ValueError) as exc:
+                problems.append(f".agents/hooks.json invalid JSON: {exc}")
+
+        plug_fp = rp / ".agents" / "plugins.json"
+        if not plug_fp.is_file():
+            shadows.append("workspace missing .agents/plugins.json (run agy_setup.py --apply)")
+        else:
+            try:
+                pdata = json.loads(plug_fp.read_text(encoding="utf-8-sig"))
+                entries = pdata.get("entries") if isinstance(pdata, dict) else None
+                if not isinstance(entries, list):
+                    problems.append(".agents/plugins.json missing 'entries' array")
+                else:
+                    found_dw = False
+                    for ent in entries:
+                        if not isinstance(ent, dict) or not isinstance(ent.get("path"), str):
+                            continue
+                        ep = pathlib.Path(ent["path"])
+                        if not ep.is_absolute():
+                            ep = (rp / ep).resolve()
+                        if (ep / "director-work" / "plugin.json").is_file() or (ep.name == "director-work" and (ep / "plugin.json").is_file()):
+                            found_dw = True
+                            break
+                    if not found_dw:
+                        shadows.append(".agents/plugins.json does not register 'director-work' plugin (run agy_setup.py --apply)")
+            except (OSError, ValueError) as exc:
+                problems.append(f".agents/plugins.json invalid JSON: {exc}")
 
     return problems, shadows, notes
 
 
 def main(argv=None):
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("directors", nargs="+", metavar="DIRECTOR", help="DIRECTOR folder(s) to check")
     ap.add_argument("--repo", help="optional workspace repo to check .agents/hooks.json and plugins.json")

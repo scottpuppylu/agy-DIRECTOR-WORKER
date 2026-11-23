@@ -31,7 +31,7 @@ import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-REBUILD_VERSION = "2.6.0-agy.1"
+REBUILD_VERSION = "2.6.0-agy.2"
 READ_TOOLS = {"read_file", "view_file", "list_dir"}
 SUBAGENT_TOOLS = {"invoke_subagent", "swarm", "Agent", "Task"}
 CREATED_RE = re.compile(r"^Created At:\s*(\S+)", re.M)
@@ -124,25 +124,92 @@ def parse_step_timing_and_error(content, status):
     return duration_ms, is_err, is_int
 
 
+def parse_raw_args(tc):
+    """Extract tool call args dict supporting both Antigravity `args` and `arguments` (dict or JSON string)."""
+    if not isinstance(tc, dict):
+        return {}
+    raw = tc.get("args")
+    if raw is None:
+        raw = tc.get("arguments")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _scan_tail_for_step(path, step_idx, require_generic=False):
+    """Scan JSONL from EOF in growing tail chunks using byte prefilter before JSON parsing."""
+    if not path.is_file() or step_idx is None:
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size <= 0:
+        return None
+    needle = str(step_idx).encode("ascii")
+    chunks = (65536, 262144, 1048576, 4194304, size)
+    seen_chunks = set()
+    try:
+        with open(path, "rb") as fh:
+            for span in chunks:
+                span = min(span, size)
+                if span in seen_chunks:
+                    continue
+                seen_chunks.add(span)
+                offset = max(0, size - span)
+                fh.seek(offset)
+                raw = fh.read(span)
+                if offset > 0:
+                    nl = raw.find(b"\n")
+                    if nl >= 0:
+                        raw = raw[nl + 1:]
+                for line in reversed(raw.splitlines()):
+                    if not line.strip() or needle not in line:
+                        continue
+                    try:
+                        obj = json.loads(line.decode("utf-8", errors="replace"))
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("step_index") == step_idx:
+                        if require_generic and obj.get("type") != "GENERIC":
+                            continue
+                        return obj
+                if offset == 0:
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def find_step_in_transcript(transcript_path, step_idx):
+    """Locate step_idx quickly from transcript.jsonl (tail-first), falling back to transcript_full.jsonl only if truncated."""
+    if not transcript_path or step_idx is None:
+        return False, None, ""
+    tp = pathlib.Path(transcript_path)
+    obj = _scan_tail_for_step(tp, step_idx, require_generic=True) or _scan_tail_for_step(tp, step_idx, require_generic=False)
+    if obj is None:
+        return False, None, ""
+    if obj.get("truncated_fields"):
+        full = tp.with_name("transcript_full.jsonl")
+        if full.is_file() and full.resolve() != tp.resolve():
+            full_obj = _scan_tail_for_step(full, step_idx, require_generic=(obj.get("type") == "GENERIC")) or _scan_tail_for_step(full, step_idx, require_generic=False)
+            if full_obj is not None:
+                obj = full_obj
+    content = obj.get("content")
+    return True, obj.get("status"), (content if isinstance(content, str) else "")
+
+
 def load_transcript_steps(transcript_path):
-    """Load steps from transcript.jsonl, automatically resolving truncated fields from transcript_full.jsonl."""
+    """Load steps from transcript.jsonl, resolving truncated steps from transcript_full.jsonl only when needed."""
     tp = pathlib.Path(transcript_path)
     if not tp.is_file():
         raise FileNotFoundError(f"transcript not found: {tp}")
-    full_path = tp.with_name("transcript_full.jsonl")
-    full_by_idx = {}
-    if full_path.is_file() and full_path.resolve() != tp.resolve():
-        for line in full_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict) and "step_index" in obj:
-                    full_by_idx[obj["step_index"]] = obj
-            except ValueError:
-                continue
 
     steps = []
+    truncated_idxs = set()
     for line in tp.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
@@ -151,9 +218,28 @@ def load_transcript_steps(transcript_path):
         except ValueError:
             continue
         if isinstance(obj, dict):
-            if obj.get("truncated_fields") and obj.get("step_index") in full_by_idx:
-                obj = full_by_idx[obj["step_index"]]
+            if obj.get("truncated_fields") and "step_index" in obj:
+                truncated_idxs.add(obj["step_index"])
             steps.append(obj)
+
+    if truncated_idxs:
+        full_path = tp.with_name("transcript_full.jsonl")
+        if full_path.is_file() and full_path.resolve() != tp.resolve():
+            full_by_idx = {}
+            for line in full_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict) and obj.get("step_index") in truncated_idxs:
+                        full_by_idx[obj["step_index"]] = obj
+                except ValueError:
+                    continue
+            if full_by_idx:
+                steps = [
+                    full_by_idx[s["step_index"]] if (s.get("truncated_fields") and s.get("step_index") in full_by_idx) else s
+                    for s in steps
+                ]
     return steps, tp
 
 
@@ -242,7 +328,7 @@ def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
         elif stype == "GENERIC" and pending:
             tc, p_step, p_ts = pending.popleft()
             raw_name = tc.get("name") or "?"
-            raw_args = tc.get("args") or {}
+            raw_args = parse_raw_args(tc)
             tool, tool_raw, norm_input = normalize_tool_and_input(raw_name, raw_args)
             content = st.get("content") or ""
             status_val = st.get("status") or "DONE"
@@ -285,32 +371,40 @@ def cmd_hook_append(args):
 
     tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
     raw_name = tc.get("name") if isinstance(tc.get("name"), str) else "?"
-    raw_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+    raw_args = parse_raw_args(tc)
     tool, tool_raw, norm_input = normalize_tool_and_input(raw_name, raw_args)
 
     step_idx = payload.get("stepIdx")
     conv_id = payload.get("conversationId") if isinstance(payload.get("conversationId"), str) else None
     err = payload.get("error")
     tp = payload.get("transcriptPath")
-    body = ""
-    if tp and step_idx is not None:
-        try:
-            for st in load_transcript_steps(tp)[0]:
-                if st.get("step_index") == step_idx and st.get("type") == "GENERIC":
-                    body = st.get("content") or ""
-                    break
-        except OSError:
-            pass
+    inline_res = None
+    for rk in ("toolResult", "toolResponse", "output", "response"):
+        if rk in payload and payload[rk] is not None:
+            inline_res = payload[rk] if isinstance(payload[rk], str) else json.dumps(payload[rk], ensure_ascii=False)
+            break
+
+    found_step, step_status, body = find_step_in_transcript(tp, step_idx) if (tp and step_idx is not None) else (False, None, "")
+    if not found_step and inline_res is not None:
+        found_step, body = True, inline_res
 
     if err:
         kind = "failure"
         res = audit.output_record("error", err)
-    elif body and EXIT_NONZERO_RE.search(body):
-        kind = "failure"
-        res = audit.output_record("error", body)
+    elif found_step:
+        if step_status == "ERROR" or (body and EXIT_NONZERO_RE.search(body)):
+            kind = "failure"
+            res = audit.output_record("error", body)
+        elif step_status in ("CANCELED", "CANCELLED", "INTERRUPTED"):
+            kind = "failure"
+            res = audit.output_record("interrupted", body)
+        else:
+            kind = "result"
+            res = audit.output_record("ok", body)
     else:
+        # Honest reporting: never claim status=ok when neither error nor matching tool output was observed
         kind = "result"
-        res = audit.output_record("ok", body)
+        res = audit.output_record("unverified", "")
 
     fields = {
         "session_id": conv_id,
@@ -452,7 +546,7 @@ def cmd_build(args):
 
 
 def cmd_verify(args):
-    """Delegate verification directly to upstream audit_log.py."""
+    """Delegate chain verification to audit_log.py, then summarize result verification status."""
     audit = load_sibling("audit_log")
     argv = ["verify", "--log", args.log]
     if args.from_seq is not None:
@@ -469,7 +563,33 @@ def cmd_verify(args):
         argv += ["--repo", args.repo]
     if args.cite:
         argv += ["--cite", args.cite]
-    return audit.main(argv)
+    old_argv = sys.argv
+    sys.argv = ["audit_log.py"] + argv
+    try:
+        rc = audit.main()
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else 0
+    finally:
+        sys.argv = old_argv
+    if rc == 0 and pathlib.Path(args.log).is_file():
+        c_ok = c_err = c_unv = 0
+        try:
+            for line in pathlib.Path(args.log).read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                if obj.get("kind") in ("result", "failure") and isinstance(obj.get("result"), dict):
+                    st = obj["result"].get("status")
+                    if st == "ok":
+                        c_ok += 1
+                    elif st in ("error", "interrupted"):
+                        c_err += 1
+                    elif st == "unverified":
+                        c_unv += 1
+            print(f"AGY_AUDIT_STATUS: chain=OK confirmed_ok={c_ok} confirmed_error={c_err} unverified={c_unv}")
+        except (OSError, ValueError):
+            pass
+    return rc
 
 
 def parse_day(text, end=False):

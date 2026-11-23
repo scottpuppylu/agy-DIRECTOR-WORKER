@@ -112,54 +112,109 @@ def render_resume_text(resume_path, max_bytes=2048):
     return ri.render(text, path.as_posix(), max_bytes, ri.DEFAULT_SECTIONS).rstrip("\n")
 
 
+def _scan_tail_step(path, step_idx):
+    """Scan JSONL from EOF in growing chunks using byte prefilter before JSON parsing."""
+    if not path.is_file() or step_idx is None:
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size <= 0:
+        return None
+    needle = str(step_idx).encode("ascii")
+    chunks = (65536, 262144, 1048576, 4194304, size)
+    seen = set()
+    try:
+        with open(path, "rb") as fh:
+            for span in chunks:
+                span = min(span, size)
+                if span in seen:
+                    continue
+                seen.add(span)
+                offset = max(0, size - span)
+                fh.seek(offset)
+                raw = fh.read(span)
+                if offset > 0:
+                    nl = raw.find(b"\n")
+                    if nl >= 0:
+                        raw = raw[nl + 1:]
+                for line in reversed(raw.splitlines()):
+                    if not line.strip() or needle not in line:
+                        continue
+                    try:
+                        obj = json.loads(line.decode("utf-8", errors="replace"))
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("step_index") == step_idx:
+                        return obj
+                if offset == 0:
+                    break
+    except OSError:
+        return None
+    return None
+
+
 def find_step_text(transcript_path, step_idx):
-    """Extract full step content for step_idx from transcript.jsonl / transcript_full.jsonl."""
+    """Extract step content for step_idx from transcript.jsonl tail, falling back to transcript_full.jsonl only if truncated."""
     if not transcript_path or step_idx is None:
         return ""
     tp = pathlib.Path(transcript_path)
-    full = tp.with_name("transcript_full.jsonl")
-    candidates = [full, tp] if full.is_file() else [tp]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if not line.strip():
+    obj = _scan_tail_step(tp, step_idx)
+    if obj is None:
+        return ""
+    if obj.get("truncated_fields"):
+        full = tp.with_name("transcript_full.jsonl")
+        if full.is_file() and full.resolve() != tp.resolve():
+            full_obj = _scan_tail_step(full, step_idx)
+            if full_obj is not None:
+                obj = full_obj
+    content = obj.get("content")
+    return content if isinstance(content, str) else ""
+
+
+def count_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0):
+    """Incrementally count SYSTEM/CHECKPOINT compaction steps using a byte offset cursor."""
+    if not transcript_path:
+        return prev_count, prev_offset
+    tp = pathlib.Path(transcript_path)
+    if not tp.is_file():
+        return 0, 0
+    try:
+        size = tp.stat().st_size
+    except OSError:
+        return prev_count, prev_offset
+    if size == prev_offset:
+        return prev_count, prev_offset
+    if size < prev_offset:
+        prev_count, prev_offset = 0, 0
+    added = 0
+    new_offset = prev_offset
+    try:
+        with open(tp, "rb") as fh:
+            fh.seek(prev_offset)
+            raw = fh.read()
+        last_nl = raw.rfind(b"\n")
+        if last_nl >= 0:
+            complete = raw[:last_nl + 1]
+            new_offset = prev_offset + len(complete)
+            for line in complete.splitlines():
+                if b'"CHECKPOINT"' not in line:
                     continue
-                obj = json.loads(line)
-                if obj.get("step_index") == step_idx:
-                    if path == tp and obj.get("truncated_fields") and full.is_file():
-                        break  # retry against transcript_full.jsonl
-                    parts = []
-                    if isinstance(obj.get("content"), str):
-                        parts.append(obj["content"])
-                    return "\n".join(parts)
-        except (OSError, ValueError):
-            continue
-    return ""
+                try:
+                    obj = json.loads(line.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "CHECKPOINT":
+                    added += 1
+    except OSError:
+        return prev_count, prev_offset
+    return prev_count + added, new_offset
 
 
 def count_checkpoints(transcript_path):
-    """Count SYSTEM/CHECKPOINT compaction steps in transcript.jsonl."""
-    if not transcript_path:
-        return 0
-    tp = pathlib.Path(transcript_path)
-    if not tp.is_file():
-        return 0
-    count = 0
-    try:
-        for line in tp.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if obj.get("type") == "CHECKPOINT":
-                count += 1
-    except OSError:
-        return 0
-    return count
+    """Backwards-compatible wrapper returning total CHECKPOINT step count."""
+    return count_checkpoints_incremental(transcript_path, 0, 0)[0]
 
 
 def log_target_from_call(tool_name, args):
@@ -197,12 +252,13 @@ def cmd_session_start(args):
                 "metadata": {"user_markdown": f"> **agydw** 已載入（`{ws_label}`）— RESUME_STATE 已注入。"},
             }
         })
-    # Record initial checkpoint count so pre-invocation only triggers on new compactions
+    # Record initial checkpoint count + byte offset so pre-invocation incrementally tracks new compactions
     if args.state_dir and payload.get("transcriptPath"):
         folder = pathlib.Path(args.state_dir)
         folder.mkdir(parents=True, exist_ok=True)
         meta_file = folder / f"compaction_{safe_cid(payload.get('conversationId'))}.json"
-        meta_file.write_text(json.dumps({"checkpoints": count_checkpoints(payload.get("transcriptPath"))}), encoding="utf-8")
+        cur, off = count_checkpoints_incremental(payload.get("transcriptPath"), 0, 0)
+        meta_file.write_text(json.dumps({"checkpoints": cur, "offset": off}), encoding="utf-8")
     print(json.dumps({"injectSteps": steps} if steps else {}, ensure_ascii=False))
     return 0
 
@@ -212,7 +268,13 @@ def cmd_post_tool(args):
     payload = read_stdin_json()
     tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
     tool_name = tc.get("name") if isinstance(tc.get("name"), str) else ""
-    tool_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+    raw_args = tc.get("args") if tc.get("args") is not None else tc.get("arguments")
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except ValueError:
+            raw_args = {}
+    tool_args = raw_args if isinstance(raw_args, dict) else {}
     conv_id = payload.get("conversationId")
 
     if args.state_dir:
@@ -266,15 +328,17 @@ def cmd_pre_invocation(args):
         folder.mkdir(parents=True, exist_ok=True)
         meta_file = folder / f"compaction_{safe_cid(conv_id)}.json"
         try:
-            prev = json.loads(meta_file.read_text(encoding="utf-8")).get("checkpoints", 0) if meta_file.is_file() else 0
-        except (OSError, ValueError):
-            prev = 0
-        cur = count_checkpoints(payload.get("transcriptPath"))
+            meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.is_file() else {}
+            prev = int(meta.get("checkpoints", 0))
+            prev_off = int(meta.get("offset", 0))
+        except (OSError, ValueError, TypeError):
+            prev, prev_off = 0, 0
+        cur, new_off = count_checkpoints_incremental(payload.get("transcriptPath"), prev, prev_off)
         if cur > prev:
-            meta_file.write_text(json.dumps({"checkpoints": cur}), encoding="utf-8")
+            meta_file.write_text(json.dumps({"checkpoints": cur, "offset": new_off}), encoding="utf-8")
             messages.insert(0, "[compaction detected] " + render_resume_text(args.resume, args.max_bytes))
-        elif not meta_file.is_file():
-            meta_file.write_text(json.dumps({"checkpoints": cur}), encoding="utf-8")
+        elif new_off != prev_off or not meta_file.is_file():
+            meta_file.write_text(json.dumps({"checkpoints": cur, "offset": new_off}), encoding="utf-8")
 
     steps = [{"systemMessage": {"systemMessage": "\n\n".join(messages)}}] if messages else []
     print(json.dumps({"injectSteps": steps} if steps else {}, ensure_ascii=False))
@@ -334,7 +398,8 @@ def cmd_stop_check(args):
 
 
 def main(argv=None):
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 

@@ -3,6 +3,26 @@
 本 repo 是 [DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK) `v2.6.0`（commit `787f67b`）在 Google Antigravity（App 2.0 / `agy` CLI / IDE / Python SDK）的原生移植版（簡稱 `agydw`），並承襲同作者 `dsh-DIRECTOR-WORKER`（`v2.6.0-ds.6`）的雙軌上游同步架構與安全閘門。
 上游完整變更歷史保留在 [`CHANGELOG-upstream.md`](CHANGELOG-upstream.md)；本檔只記 `agy-DIRECTOR-WORKER` 自己的版本與「對齊初衷」。
 
+## 2.6.0-agy.2（2026-11-24）
+
+基於獨立第三方審查重現結果，針對首次安裝體驗、總監權限邊界、稽核誠實性與長對話效能進行關鍵修補：
+
+### 關鍵修正與強化
+- **外掛官方 Schema 對齊與獨立可攜式安全帶（`plugin/director-work/`）**：
+  - 依 `https://antigravity.google/schemas/v1/plugin.json` 將 `plugin.json` 的 `repository` 由物件改為字串 URL，補齊 `$schema` 與 `license`，並讓 `agy_doctor.py` 執行完整官方 JSON Schema 欄位型別驗證。
+  - 新增純標準庫 `plugin/director-work/scripts/seatbelt_hook.py` 並改寫 `hooks.json`：即使獨立複製或安裝 `plugin/director-work/`（無外部 `../../tools/`），仍可攔截憑證讀取、`G00`/`G43`/`G01`/`G02`；若偵測到完整 `DIRECTOR/tools/` 或 repo `tools/` 則自動委派給 `agy_guard.py`。
+- **總監 `--protect` 權限修正（`tools/agy_guard.py`）**：
+  - 修正 `--protect <DIRECTOR>` 同時阻擋 `director` profile 的問題，確保 `director` 可寫入 `DIRECTOR_LOG.md` 與 `orders/`，而 `worker` / `cleaner` 仍一律強制拒絕（`deny`）。
+- **非破壞性合併安裝與誠實健檢（`agy_setup.py`、`agy_setup_check.py`、`agy_doctor.py`）**：
+  - `agy_setup.py` 遇到已存在的 `.agents/hooks.json` 或 `.agents/plugins.json` 時，改為保留使用者既有群組與外掛清單、合併寫入 `agydw` 項目；遇毀損 JSON 直接 `exit 1` 失敗，不再假報 `DONE`。
+  - `agy_setup_check.py` 實際檢查 `agydw-guard` / `agydw-audit-and-bridge` 與 `director-work` 是否真的在設定檔內（不再只驗 JSON 語法）；`agy_doctor.py` 移除過度樂觀的靜態 `ENFORCED` 標籤，區分 `CONFIGURED` 與實際透過 OS Shell 探測後的 `HOOK_EXEC_OK`。
+- **稽核誠實化與效能優化（`tools/agy_audit.py`、`tools/agy_hook_bridge.py`）**：
+  - `hook-append` 在既無 `error` 亦找不到對應輸出時改記 `result.status="unverified"`（不再假寫 `ok`），並於 `agy_audit.py verify` 輸出 `confirmed_ok` / `confirmed_error` / `unverified` 統計；同時相容 `args` 與 `arguments`（含 JSON 編碼字串）。
+  - `agy_hook_bridge.py` 與 `agy_audit.py` 改採尾端分塊預篩與位元偏移量增量游標讀取 `transcript.jsonl`，避免長對話每次全檔重掃。
+- **文件、範本與隔離描述修正＋跨平台 CI**：
+  - 修正 `README.md`、`BOOTSTRAP.md`、`dw-review-gate/SKILL.md` 的 `evidence_record.py verify --rerun` 參數；補齊 `templates/TEST_REQUEST.md` 的 `v2.6.0` `CODE_REFS:` 等必填欄位；將 `docs/11` 與 `templates/WORK_ORDER.md` 的 `workspace: branch` 更正為準確的「隔離 Git worktree」。
+  - 新增 `.github/workflows/ci.yml`（`windows-latest` ＋ `ubuntu-latest` 矩陣）與全面回歸測試於 `tools/selftest_agy.py`。
+
 ## 2.6.0-agy.1（2026-11-24）
 
 首個完整移植與端到端驗證版本（對齊上游 `DW v2.6.0` + `dshdw 2.6.0-ds.6`）。

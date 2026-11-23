@@ -10,18 +10,18 @@
 
 ### 方法一：Antigravity Plugin 安裝（推薦，開箱即用）
 
-本 repo 內建完整的 Antigravity 外掛套件 [`plugin/director-work/`](plugin/director-work/plugin.json)，包含精簡規則（`< 4 KB`，遠低於 Antigravity 單檔 24 KB 上限）、預設 `PreToolUse` 安全帶 Hook、5 個作業流程 Skill 與 3 個專用子代理（`dw-worker`、唯讀 `dw-blind-reviewer`、`dw-visual-qa`）。
+本 repo 內建完整的 Antigravity 外掛套件 [`plugin/director-work/`](plugin/director-work/plugin.json)（已對齊官方 JSON Schema），包含精簡規則（`< 4 KB`，遠低於 Antigravity 單檔 24 KB 上限）、可獨立運行的 `PreToolUse` 安全帶 Hook（`scripts/seatbelt_hook.py`）、5 個作業流程 Skill 與 3 個專用子代理（`dw-worker`、唯讀 `dw-blind-reviewer`、`dw-visual-qa`）。
 
-**快速掛載（單一專案，不動使用者全域設定）：**
+**快速掛載（單一專案，不動使用者全域設定；既有 `.agents/` 設定採非破壞性合併）：**
 
 ```text
-python -I -X utf8 D:/path/to/agy-DIRECTOR-WORKER/tools/agy_setup.py --repo D:/path/to/your-project --init-director --apply
+python -B -I -X utf8 D:/path/to/agy-DIRECTOR-WORKER/tools/agy_setup.py --repo D:/path/to/your-project --init-director --apply
 ```
 
 這支腳本會一次做好三件事（全程不碰 `~/.gemini/config/config.json`）：
 1. 在 `<REPO>/.git/info/exclude` 排除本機產物（`AGENTS.local.md`、`.agents/hooks.local.json`、`_work/`）。
-2. 在 `<REPO>/.agents/plugins.json` 掛載 `agy-DIRECTOR-WORKER/plugin`，並在 `<REPO>/.agents/hooks.json` 裝好全套 `PreToolUse` / `PostToolUse` / `SessionStart` / `PreInvocation` / `Stop` Hook（Windows `cmd /c` 與含空白路徑安全驗證過）。
-3. 在專案外建立 `<WS>/DIRECTOR/` 狀態資料夾與本機工具複本，然後跑一次 `agy_doctor.py` 與 `agy_setup_check.py --strict` 自檢。
+2. 在 `<REPO>/.agents/plugins.json` 合併掛載 `agy-DIRECTOR-WORKER/plugin`，並在 `<REPO>/.agents/hooks.json` 合併寫入 `agydw-guard` 與 `agydw-audit-and-bridge`（保留既有設定，Windows `cmd /c` 與含空白路徑安全驗證過）。
+3. 在專案外建立 `<WS>/DIRECTOR/` 狀態資料夾與本機工具複本，然後跑一次 `agy_doctor.py` 與 `agy_setup_check.py --strict` 驗證。
 
 掛載後，在 Antigravity 開新對話直接點選外掛建議指令或輸入：
 - `請啟動總監制 bootstrap：幫這個專案選擇一般模式或小白模式並建立 DIRECTOR/ 狀態`
@@ -89,7 +89,7 @@ AI agent 是**「會自己打開檔案、改程式、跑測試與檢查結果的
 | **總監（Coordinator）** | 你的主對話視窗，負責對接 PO、拆工單、驗收成果 | 工地主任／專案經理 |
 | **Worker（子代理 / Swarm）** | 總監用 `invoke_subagent` 或 `swarm` 開出來的助手 | 領工單進小房間專心施工的工程師 |
 | **盲審（dw-blind-reviewer）** | YAML 只授權 `read_file` 的純唯讀審查員，看不到也不改程式碼現場以外的流程 | 獨立稽核員（只看檔案與帳本，沒有權限改任何東西） |
-| **workspace="branch"** | Antigravity 原生建立隔離工作副本給子代理各自施工 | 每位工程師發一份獨立影本去改，改完核對才合併 |
+| **workspace="branch"** | Antigravity 原生建立隔離的 Git worktree 給子代理各自施工 | 每位工程師在獨立資料夾與草稿分支施工（底層共用 Git 物件庫） |
 | **PreToolUse / Hook** | 工具執行前／後自動觸發的檢查腳本（`.agents/hooks.json`） | 門口的安全門禁＋作業過程自動攝影紀錄 |
 | **OS 原生沙箱** | Windows AppContainer / macOS `sandbox-exec` / Linux namespaces | 系統層的防護牆：工坊外面的資料夾看得到但改不到 |
 | **PO 待決帳** | 總監用 `ask_question` 彈出題目問你，並記進 `DIRECTOR/PO_PENDING.md` | 每天要你簽核的待辦清單 |
@@ -113,7 +113,7 @@ flowchart TD
 
 | 防護層 | 等級 | 實際怎麼運作 | 在 Antigravity 上的強化重點 |
 |---|---|---|---|
-| **1. 系統與目錄隔離** | **OS 原生強制擋** | Windows 11 AppContainer / macOS `sandbox-exec` / Linux namespaces＋`workspace: "branch"`/`"share"` | **移除 Docker**：直接用 Antigravity 原生 OS 沙箱與分支複製隔離，Windows 上專案路徑以外預設唯讀 |
+| **1. 系統與目錄隔離** | **OS 原生強制擋** | Windows 11 AppContainer / macOS `sandbox-exec` / Linux namespaces＋`workspace: "branch"`/`"share"` | **移除 Docker**：以 Antigravity 原生 OS 沙箱搭配隔離 Git worktree（`workspace: "branch"`），Windows 上專案路徑以外預設唯讀（非獨立 `.git` 或 VM 邊界） |
 | **2. 工具呼叫前安全帶** | **Hook 主動擋／強制問** | `PreToolUse` 呼叫 `agy_guard.py`（支援 `--mode remind \| ask \| block`） | 自動識別 Antigravity App 2.0 與 IDE/CLI 雙命名，並解決 Windows `cmd /c` 雙引號剝除陷阱；`--protect` 擋住 worker 私改工單與 `DIRECTOR_LOG.md` |
 | **3. 過程提醒與恢復** | **兩段式即時提醒** | `SessionStart` → `PostToolUse` 寫入佇列 (`{}`) → `PreInvocation` 注入 `injectSteps` → `Stop` | 順應 Antigravity `PostToolUse` 必須輸出 `{}` 的協議，用兩段式橋接還原打轉提醒、提示注入警告與 `CHECKPOINT` 壓縮自動接回 |
 | **4. 唯讀盲審與事後實證** | **工具白名單 + 雜湊驗證** | `dw-blind-reviewer` (`tools: [read_file]`) + `safety_gate.py` + `evidence_record.py` + `gate_check.py` + `agy_audit.py` + `agy_usage.py` | 審查員從定義上就拿不到寫檔／shell 工具；`agy_audit.py` 與 `agy_usage.py` 從 `transcript.jsonl` 還原精確工具軌跡與 `input + cache_read` 上下文大小 |
@@ -159,27 +159,27 @@ flowchart LR
 ## 常用指令速查（給總監與進階玩家）
 
 ```text
-# 1. 一鍵替專案安裝 agydw Hook、Plugin 參照與 DIRECTOR/ 骨架
-python -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --init-director --apply
+# 1. 一鍵替專案安裝 agydw Hook、Plugin 參照與 DIRECTOR/ 骨架（保留既有 .agents 設定）
+python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --init-director --apply
 
-# 2. 環境與外掛健康檢查（含 Windows cmd /c Hook 實測探測）
-python -I -X utf8 <RULES>/tools/agy_doctor.py --repo <REPO> --plugin <RULES>/plugin/director-work --probe-hooks
+# 2. 環境與外掛健康檢查（含官方 Plugin Schema 檢查與真實 Shell Hook 執行測試）
+python -B -I -X utf8 <RULES>/tools/agy_doctor.py --repo <REPO> --plugin <RULES>/plugin/director-work --probe-hooks
 
-# 3. 檢查 DIRECTOR/ 檔案格式與必填欄位
-python -I -X utf8 <RULES>/tools/agy_setup_check.py --strict <WS>/DIRECTOR
+# 3. 檢查 DIRECTOR/ 與工作區 .agents/ 設定一致性
+python -B -I -X utf8 <RULES>/tools/agy_setup_check.py --strict <WS>/DIRECTOR --repo <REPO>
 
 # 4. 鎖定測試檔案與核准 PLAN.md
-python -I -X utf8 <RULES>/tools/safety_gate.py --lock-tests tests/test_calc.py --repo <REPO>
-python -I -X utf8 <RULES>/tools/safety_gate.py --plan-hash <WORK_DIR>/WO-001/PLAN.md --order <DIRECTOR>/orders/WO-001.md
+python -B -I -X utf8 <RULES>/tools/safety_gate.py --lock-tests tests/test_calc.py --repo <REPO>
+python -B -I -X utf8 <RULES>/tools/safety_gate.py --plan-hash <WORK_DIR>/WO-001/PLAN.md --order <DIRECTOR>/orders/WO-001.md
 
 # 5. 驗收交件與動作／用量稽核
-python -I -X utf8 <RULES>/tools/evidence_record.py verify --order <WO> --evidence-dir <EVID> --rerun
-python -I -X utf8 <RULES>/tools/gate_check.py --match <REPORT> <WO> --evidence-dir <EVID> --dispatch-log <DIRECTOR>/DIRECTOR_LOG.md --repo <REPO> --candidate <HEAD>
-python -I -X utf8 <RULES>/tools/agy_audit.py build --transcript <TRANSCRIPT> --include-subagents --out <DIRECTOR>/research/audit.jsonl
-python -I -X utf8 <RULES>/tools/agy_usage.py --project-dir <REPO> --include-subagents --loops --out <DIRECTOR>/usage.json
+python -B -I -X utf8 <RULES>/tools/evidence_record.py verify <EVID_JSON> --order <WO> --dispatch-log <DIRECTOR>/DIRECTOR_LOG.md --repo <REPO> --candidate <HEAD> --rerun
+python -B -I -X utf8 <RULES>/tools/gate_check.py --match <REPORT> <WO> --evidence-dir <EVID_DIR> --dispatch-log <DIRECTOR>/DIRECTOR_LOG.md --repo <REPO> --candidate <HEAD>
+python -B -I -X utf8 <RULES>/tools/agy_audit.py build --transcript <TRANSCRIPT> --include-subagents --out <DIRECTOR>/research/audit.jsonl --force
+python -B -I -X utf8 <RULES>/tools/agy_usage.py --project-dir <REPO> --include-subagents --loops --out <DIRECTOR>/usage.json
 
 # 6. 執行整套 rules 套件自我檢測
-python -I -X utf8 <RULES>/tools/selftest_agy.py --verbose
+python -B -I -X utf8 <RULES>/tools/selftest_agy.py --verbose
 ```
 
 ---

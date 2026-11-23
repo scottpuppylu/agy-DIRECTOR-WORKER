@@ -9,7 +9,7 @@ Claude Desktop 受限於「只有 PO 親自發訊息的那一輪能 `start_sessi
 | 層級 | 工具 / 指令 | 適合場景 | 工作區隔離與關鍵特性 |
 |---|---|---|---|
 | **1. 單對話雙模型交棒** | **Orchestrator**（模型選單） | 單人可完成的 `Direct` / 小型 `Standard` 修改 | 高階 Planner（如 Neon/Carbon）規劃覆核 + 較快 Executor（Hydrogen）實作；單上下文、協調成本最低 |
-| **2. 自訂隔離子代理** | `define_subagent` / `invoke_subagent` + `send_message` | 單一明確工單（`dw-worker`）、**物理唯讀盲審（`dw-blind-reviewer`）**、視覺 QA（`dw-visual-qa`） | 支援 `Workspace`: `"inherit"`（僅唯讀審查用）、`"share"`（共用底層 repo 的獨立工作副本）、**`"branch"`（完全獨立 Git clone，天然解決共用 `.git` 竄改風險）** |
+| **2. 自訂隔離子代理** | `define_subagent` / `invoke_subagent` + `send_message` | 單一明確工單（`dw-worker`）、**物理唯讀盲審（`dw-blind-reviewer`）**、視覺 QA（`dw-visual-qa`） | 支援 `Workspace`: `"inherit"`（與父代理共用目錄，僅建議唯讀用）、`"share"`（共用底層 repo 的工作副本）、**`"branch"`（Antigravity 自動建立隔離的 Git worktree 與獨立分支，避免多寫手在工作目錄互踩，但底層 Git 物件與 refs 仍屬同 repo，非 VM 級隔離）** |
 | **3. 團隊共享留言板** | `swarm` + `post_message` + `read_board` + `swarm_wait` | 2–8+ 條平行工作線、作者↔審查員↔收尾接力 | - `workspace: "share" \| "branch"` 隔離寫手<br>- `swarm_wait` **休眠零 token**<br>- `channel` 分區（>8 人必分頻道，維持 `main` 安靜）<br>- `fork` 熱分岔繼承既有上下文<br>- `swarm{action:"models"}` 查**即時剩餘額度**、`swarm{action:"model"}` **保留歷史熱切換模型**<br>- 內建 `@monitor` 防全體靜默卡死＋Swarm Overview 截圖時間軸 |
 | **4. 程式化平行管線** | `run_workflow`（Python `parallel` / `pipeline` / `phase`） | 多角度 `SPEC_REVIEW`、大量檔案檢查、結構化交件閘門 | 強制每個子代理透過 `finish` 工具回傳符合 **JSON Schema** 的結果；可於 `templates/workflows/` 直接套用 |
 

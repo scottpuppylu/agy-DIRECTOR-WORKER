@@ -17,7 +17,7 @@ description: >-
 1. **範圍與上限檢查**：
    `python -I -X utf8 <DIRECTOR>/tools/scope_check.py --order <ORDER_MD> --repo <WORKER_REPO> --candidate <HEAD_SHA>`
 2. **證據重跑驗證**：
-   `python -I -X utf8 <DIRECTOR>/tools/evidence_record.py verify <EVIDENCE_JSON> --rerun`
+   `python -B -I -X utf8 <DIRECTOR>/tools/evidence_record.py verify <EVIDENCE_JSON> --order <ORDER_MD> --dispatch-log <DIRECTOR>/DIRECTOR_LOG.md --repo <WORKER_REPO> --candidate <HEAD_SHA> --rerun`
 3. **動作稽核鏈對照報告**：
    - 若已啟用 `PostToolUse` hook log：先跑 `audit_log.py verify --log <AUDIT_LOG>`。
    - 若要從對話紀錄獨立複驗：
