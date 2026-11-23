@@ -11,6 +11,7 @@ Invoke via Antigravity `run_workflow` tool with:
 """
 import json
 import pathlib
+import shutil
 
 order = args["order"]
 report = args["report"]
@@ -24,6 +25,7 @@ if not tools.is_dir():
 
 evidence_dir = pathlib.Path(director) / "evidence"
 dispatch_log = pathlib.Path(director) / "DIRECTOR_LOG.md"
+py_exe = shutil.which("python3") or shutil.which("python") or "python3"
 
 VERDICT_SCHEMA = {
     "type": "object",
@@ -38,15 +40,15 @@ VERDICT_SCHEMA = {
 }
 
 phase("Mechanical Gates")
-scope_cmd = f'python -I -X utf8 "{tools / "scope_check.py"}" --order "{order}" --repo "{repo}" --candidate "{candidate}"'
+scope_cmd = f'"{py_exe}" -B -I -X utf8 "{tools / "scope_check.py"}" --order "{order}" --repo "{repo}" --candidate "{candidate}"'
 match_cmd = (
-    f'python -I -X utf8 "{tools / "gate_check.py"}" --match "{report}" "{order}" '
+    f'"{py_exe}" -B -I -X utf8 "{tools / "gate_check.py"}" --match "{report}" "{order}" '
     f'--evidence-dir "{evidence_dir}" --dispatch-log "{dispatch_log}" --repo "{repo}" --candidate "{candidate}"'
 )
 
 async def run_checked(cmd):
     try:
-        return await call_tool("run_command", CommandLine=cmd, Cwd=repo, WaitMsBeforeAsync=10000)
+        return await call_tool("run_command", CommandLine=cmd, toolSummary="Run gate verification command", WaitMsBeforeAsync=10000)
     except ToolError as err:
         return f"TOOL_ERROR: {err.message}"
 

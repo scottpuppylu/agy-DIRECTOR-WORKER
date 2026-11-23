@@ -19,6 +19,7 @@ Usage:
 import argparse
 import collections
 import datetime
+import hashlib
 import importlib.util
 import json
 import os
@@ -53,6 +54,11 @@ def to_local_iso(dt):
     return dt.astimezone().isoformat(timespec="seconds")
 
 
+def _case_norm(s):
+    """Preserve exact casing on POSIX filesystems while staying case-insensitive on Windows."""
+    return s.lower() if os.name == "nt" else s
+
+
 def compile_project_patterns(project_norm_list):
     """Compile boundary-safe path regexes so '/tmp/app' never matches '/tmp/app-long'."""
     patterns = []
@@ -60,7 +66,7 @@ def compile_project_patterns(project_norm_list):
         p = raw.rstrip("/")
         if not p:
             continue
-        patterns.append(re.compile(rf"(?<![a-z0-9._:/-]){re.escape(p)}(?=$|[/\\\"'\s,;:)\]}}])"))
+        patterns.append(re.compile(rf"(?<![A-Za-z0-9._:/-]){re.escape(p)}(?=$|[/\\\"'\s,;:)\]}}])"))
     return patterns
 
 
@@ -68,39 +74,53 @@ def _norm_ws_path(val):
     if not isinstance(val, str) or not val.strip():
         return None
     s = val.strip().replace("\\", "/")
-    if len(s) >= 2 and s[1] == ":":
+    if os.name == "nt" and len(s) >= 2 and s[1] == ":":
         s = s[0].lower() + s[1:]
     return s.rstrip("/") or "/"
 
 
 def _ws_path_variants(val):
-    """Return lowercase normalized path variants (raw + resolved when absolute) for 8.3/symlink safety."""
+    """Return normalized path variants (raw + resolved when absolute) preserving POSIX case."""
     nv = _norm_ws_path(val)
     if not nv:
         return []
-    out = [nv.lower()]
+    out = [_case_norm(nv)]
     try:
         p = pathlib.Path(val.strip())
         if p.is_absolute():
             rv = _norm_ws_path(str(p.resolve()))
-            if rv and rv.lower() not in out:
-                out.append(rv.lower())
+            if rv:
+                rc = _case_norm(rv)
+                if rc not in out:
+                    out.append(rc)
     except (OSError, RuntimeError, ValueError):
         pass
     return out
 
 
-def extract_structured_workspaces(steps):
-    """Extract normalized workspace/cwd paths from structured metadata fields on transcript steps."""
+def _unwrap_arg_val(val):
+    if isinstance(val, str):
+        s = val.strip()
+        if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or s[0] in "[{"):
+            try:
+                return json.loads(s)
+            except ValueError:
+                return val
+    return val
+
+
+def extract_session_workspaces(steps):
+    """Extract normalized session/step-level workspace paths (excluding per-call tool Cwd)."""
     out = []
     seen = set()
 
     def add_val(v):
+        v = _unwrap_arg_val(v)
         if isinstance(v, str):
-            for low in _ws_path_variants(v):
-                if low and low not in seen:
-                    seen.add(low)
-                    out.append(low)
+            for cnorm in _ws_path_variants(v):
+                if cnorm and cnorm not in seen:
+                    seen.add(cnorm)
+                    out.append(cnorm)
         elif isinstance(v, list):
             for item in v:
                 add_val(item)
@@ -117,45 +137,98 @@ def extract_structured_workspaces(steps):
             for k in ws_keys:
                 if k in meta and meta[k] is not None:
                     add_val(meta[k])
-        if st.get("type") == "PLANNER_RESPONSE":
-            for tc in st.get("tool_calls") or []:
-                if not isinstance(tc, dict):
-                    continue
-                raw = tc.get("args") if tc.get("args") is not None else tc.get("arguments")
-                if isinstance(raw, str):
-                    try:
-                        raw = json.loads(raw)
-                    except ValueError:
-                        raw = {}
-                if isinstance(raw, dict):
-                    for k in ("Cwd", "cwd", "workspace"):
-                        if k in raw and raw[k] is not None:
-                            add_val(raw[k])
     return out
 
 
+def extract_tool_cwds(steps):
+    """Extract normalized per-tool Cwd/workspace fields from PLANNER_RESPONSE tool_calls (unwrapped)."""
+    out = []
+    seen = set()
+
+    def add_val(v):
+        v = _unwrap_arg_val(v)
+        if isinstance(v, str):
+            for cnorm in _ws_path_variants(v):
+                if cnorm and cnorm not in seen:
+                    seen.add(cnorm)
+                    out.append(cnorm)
+
+    for st in steps:
+        if not isinstance(st, dict) or st.get("type") != "PLANNER_RESPONSE":
+            continue
+        for tc in st.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            raw = tc.get("args") if tc.get("args") is not None else tc.get("arguments")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    raw = {}
+            if isinstance(raw, dict):
+                for k in ("Cwd", "cwd", "workspace"):
+                    if k in raw and raw[k] is not None:
+                        add_val(raw[k])
+    return out
+
+
+def extract_structured_workspaces(steps):
+    """Extract normalized workspace/cwd paths from both session metadata and unwrapped tool calls."""
+    out = []
+    seen = set()
+    for path in extract_session_workspaces(steps) + extract_tool_cwds(steps):
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _unwrapped_tool_calls_text(tool_calls):
+    cleaned = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        item = dict(tc)
+        for ak in ("args", "arguments"):
+            raw = item.get(ak)
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    pass
+            if isinstance(raw, dict):
+                item[ak] = {k: _unwrap_arg_val(v) for k, v in raw.items()}
+        cleaned.append(item)
+    return json.dumps(cleaned, ensure_ascii=False).replace("\\", "/")
+
+
 def classify_project_match(steps, project_norm_list, project_patterns):
-    """Prefer structured workspace attribution over text heuristics; prevent cross-project mention leaks."""
+    """Strictly trust session-level workspacePaths; keep tool Cwd non-exclusive against project files."""
     if not project_patterns and not project_norm_list:
         return True, "unfiltered"
 
-    ws_paths = extract_structured_workspaces(steps)
-    targets = [p.rstrip("/").lower() for p in (project_norm_list or []) if p.strip()]
-    if ws_paths:
-        for wp in ws_paths:
+    targets = [_case_norm(p.rstrip("/")) for p in (project_norm_list or []) if p.strip()]
+    session_ws = extract_session_workspaces(steps)
+    if session_ws:
+        for wp in session_ws:
             for tgt in targets:
                 if wp == tgt or wp.startswith(tgt + "/") or tgt.startswith(wp + "/"):
                     return True, "structured_workspace"
         return False, "structured_workspace_mismatch"
 
+    for cw in extract_tool_cwds(steps):
+        for tgt in targets:
+            if cw == tgt or cw.startswith(tgt + "/") or tgt.startswith(cw + "/"):
+                return True, "structured_workspace"
+
     for st in steps:
         stype = st.get("type")
         if stype == "USER_INPUT":
-            txt = (st.get("content") or "").replace("\\", "/").lower()
+            txt = _case_norm((st.get("content") or "").replace("\\", "/"))
             if any(rx.search(txt) for rx in project_patterns):
                 return True, "text_heuristic"
         elif stype == "PLANNER_RESPONSE":
-            txt = json.dumps(st.get("tool_calls") or [], ensure_ascii=False).replace("\\", "/").lower()
+            txt = _case_norm(_unwrapped_tool_calls_text(st.get("tool_calls") or []))
             if any(rx.search(txt) for rx in project_patterns):
                 return True, "text_heuristic"
     return False, "no_match"
@@ -318,40 +391,50 @@ def main(argv=None):
     sources = agy_audit.discover_transcripts(a.transcript, a.conversation, a.brain_root, a.include_subagents)
     proj_norms = []
     for p in a.project_dir:
-        for cand in _ws_path_variants(p) or [str(pathlib.Path(p).resolve()).replace("\\", "/").lower()]:
+        for cand in _ws_path_variants(p) or [_case_norm(str(pathlib.Path(p).resolve()).replace("\\", "/"))]:
             if cand not in proj_norms:
                 proj_norms.append(cand)
     proj_patterns = compile_project_patterns(proj_norms)
 
     rows = []
-    seen_cids = set()
+    seen_paths = set()
+    assigned_cids = set()
+    matched_raw_cids = set()
     for cid, tp, parent_cid in sources:
-        if cid in seen_cids:
+        tp_key = os.path.normcase(pathlib.Path(tp).resolve().as_posix())
+        if tp_key in seen_paths:
             continue
+        seen_paths.add(tp_key)
         try:
             row = summarize_conversation(cid, tp, parent_cid, agy_audit)
         except OSError:
             continue
+        steps_tmp = row.pop("_steps", [])
+        row.pop("_started_dt", None)
         if a.project_dir:
-            matched, attr_mode = classify_project_match(row["_steps"], proj_norms, proj_patterns)
+            matched, attr_mode = classify_project_match(steps_tmp, proj_norms, proj_patterns)
+            del steps_tmp
             if not parent_cid and not matched:
                 continue
-            if parent_cid and parent_cid not in seen_cids and not matched:
+            if parent_cid and parent_cid not in matched_raw_cids and not matched:
                 continue
             row["attribution_mode"] = attr_mode if matched else "inherited_parent"
         else:
+            del steps_tmp
             row["attribution_mode"] = "unfiltered"
         sdate = row["started_date"]
         if a.since and sdate != "UNKNOWN" and sdate < a.since:
             continue
         if a.until and sdate != "UNKNOWN" and sdate > a.until:
             continue
-        seen_cids.add(cid)
+        matched_raw_cids.add(cid)
+        out_cid = cid
+        if out_cid in assigned_cids:
+            h8 = hashlib.sha256(tp_key.encode("utf-8")).hexdigest()[:8]
+            out_cid = f"{cid}#{h8}"
+        assigned_cids.add(out_cid)
+        row["conversation_id"] = out_cid
         rows.append(row)
-
-    for r in rows:
-        r.pop("_steps", None)
-        r.pop("_started_dt", None)
 
     if not rows:
         no_data = {

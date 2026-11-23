@@ -3,6 +3,36 @@
 本 repo 是 [DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK) `v2.6.0`（commit `787f67b`）在 Google Antigravity（App 2.0 / `agy` CLI / IDE / Python SDK）的原生移植版（簡稱 `agydw`），並承襲同作者 `dsh-DIRECTOR-WORKER`（`v2.6.0-ds.6`）的雙軌上游同步架構與安全閘門。
 上游完整變更歷史保留在 [`CHANGELOG-upstream.md`](CHANGELOG-upstream.md)；本檔只記 `agy-DIRECTOR-WORKER` 自己的版本與「對齊初衷」。
 
+## 2.6.0-agy.5（2026-11-24）
+
+### P0 安全修補：外掛安全帶隔離與 Fail-Closed
+- **`plugin/director-work/scripts/seatbelt_hook.py`**：
+  - **移除未信任工作區腳本委派（P0-1）**：不再掃描或載入工作區內的 `DIRECTOR/tools/`、`DIRECTOR-*` 或外部 `.agydw_setup_state.json`；僅允許委派自身信任套件樹下的 `<plugin_dir>/../../tools/`，徹底杜絕開啟未信任 repo 時自動執行第三方腳本與非 ASCII 跨專案劫持。
+  - 補齊 `fallback_eval()` 對 `SearchPath`/`SearchDirectory`/`Includes`/`Pattern` 的敏感路徑檢查，並將異常、逾時、空輸入／壞 JSON 與受信任子程序非零退出碼全面改為 **Fail-Closed**（Antigravity 模式回傳 `deny` + `exit 0`），消除 `hooks.json` 的 `python ... || python3 ...` 在耗盡 stdin 後誤觸空輸入放行的風險。
+
+### P1 稽核真實性、守門完整性、安裝並發與跨平台用量修復
+- **`tools/agy_audit.py`（重建 v2.6.0-agy.5）**：
+  - **僅解析 Shell 標頭（P1-1）**：新增 `_extract_shell_header()` 搭配 `is_shell` 判斷；非 shell 工具（如 `read_file`）不再受正文 `"Command exited with code 1."`／`"process still running"` 字樣干擾，shell 工具亦只檢查 `Command output:` 之前的行首退出狀態。
+  - **Worktree 稽核鏈統一與防混（P1-2 / P2-3）**：新增純檔案系統 `.git` 追蹤 `resolve_worktree_audit_path()`（`agy_guard.py` 與 `agy_audit.py` 共用），不再於 `.agents/` 目錄裂出 `.agents.jsonl`，且自動替 linked git worktree 附加 6 碼路徑雜湊，避免同尾名 worktree 混入同一份稽核鏈。
+- **`tools/agy_guard.py`**：
+  - `AGY_PROTECTED_FILES` 與 `G00` 納入 `seatbelt_hook.py`（並於 `AGY_CONFIG_GLOBS` 加入 `**/director-work/hooks.json`）。
+  - 修復 `grep_search`/`find_by_name` 的 `path`/`Includes`/`Pattern` 檢查使 `G53`／`G50` 生效（P1-4）。
+  - 非 `director` 對 `--protect` 補上 Write/Edit 與 Shell 寫入／`Set-Content`／`mv`/`rm` 防護，保護 `DIRECTOR_LOG.md`、`orders/**`、`director_work.json`、`.agydw_setup_state.json`、`.sessions.json`、`tools/**` 與 `tools_v*/**`。
+  - 新增 `--dry-run-probe` 與 `AGYDW_DOCTOR_PROBE=1` 唯讀探測支援（P1-9）。
+- **`tools/agy_setup.py` & `tools/agy_setup_check.py`**：
+  - **專案級並發鎖覆蓋讀改寫全流程（P1-5）**：`.agydw_setup_*.lock` 擴大包覆選項載入、合併計算與寫入，`file_lock()` 補抓 Windows `PermissionError` 並以唯一持有者 token 驗證解鎖。
+  - **升級保留既有停用 Hook（P1-6）**：一般合併升級保留既有管理群組上的 `"enabled": false`；新增 `plan_director_state_migration()` 更新 `DIRECTOR_STATE.md` 的 `RULES_PATH:`；填寫 `.sessions.json["protected"]`。
+  - **路徑正規化、多外掛保護、完整預檢與開關可逆（P1-7 / P2-1 / P2-2 / P2-6）**：狀態檔路徑統一存為正規 POSIX 路徑、`agy_setup_check.py` 改以正規化 `--audit` token 比對；預檢涵蓋全部狀態／規則檔與 `tools_v*` 節點型別；偵測同父目錄多外掛時明確報錯保留原設定；`--enforce-resume`/`--overwrite-utf8`/`--no-copy-tools` 支援 `--no-enforce-resume`／`--no-overwrite-utf8`／`--copy-tools` 關閉。
+- **`tools/agy_usage.py`（P1-3 / P2-10）**：拆開 `workspacePaths` 與解包後的單次工具 `Cwd` 避免重複計入或 `NO_DATA`；外部同名 `--transcript` 改以實體路徑去重與獨立 ID；POSIX 保留路徑大小寫、Windows 維持 8.3 短路徑相容；即時釋放已處理 `_steps` 降低記憶體佔用。
+- **`tools/agy_hook_bridge.py`、`tools/agy_doctor.py`、`tools/gate_check.py`**：
+  - `stop-check` 改用 `git -c core.quotepath=false status --porcelain=v1 -z --untracked-files=all` 支援空白／中文／刪除／重命名檔（P1-8），且 `head_len = min(offset, 512)` 精確追蹤避免小檔追加誤判 compaction（P2-4），橋接狀態檔改原子寫入。
+  - `agy_doctor.py` 探測時同步傳遞 `AGYDW_DOCTOR_PROBE=1` 並將 `--audit`/`--bridge-state`/`--pause-flag` 重導向暫存目錄，落實 100% 唯讀（P1-9）。
+  - `gate_check.py --final --candidate` 依結構化 `CANDIDATE_HEAD:`/`COMMIT:`/`HEAD:` 欄位綁定並略過舊候選歷史失敗（P2-5）。
+
+### 範本、文件與回歸強化
+- 修正 `templates/workflows/gate_verify_workflow.py`（移除未定義 `Cwd`、補 `toolSummary` 與可攜 `python3`/`-B`）、`templates/WORK_ORDER.md`、`templates/AGENTS_PROJECT_SECTION.md`、`BOOTSTRAP.md`（對齊 `spec_review_for_standard` / `stop_after_rounds` / `order_limits` 及 `--candidate` 建議指令）、`dw-release/SKILL.md` 與 `ANTIGRAVITY-PORT.md`。
+- `tools/selftest_agy.py` 擴充至 **31 組**整合回歸測試（覆蓋上述全部 P0／P1／P2 場景），保持上游 **39/39** 核心檔案與 `v2.6.0` 位元完全一致。
+
 ## 2.6.0-agy.4（2026-11-24）
 
 ### 稽核真實性與多檔案清單（P1 / P2）

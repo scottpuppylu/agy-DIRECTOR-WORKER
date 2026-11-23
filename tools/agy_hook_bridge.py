@@ -30,6 +30,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 LOG_EXT = (".log", ".out", ".err", ".txt")
@@ -184,8 +185,26 @@ def find_step_text(transcript_path, step_idx):
     return content if isinstance(content, str) else ""
 
 
+def _write_text_atomic(path, text):
+    """Write UTF-8 LF text atomically via same-directory temporary file + os.replace."""
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", dir=str(p.parent), prefix=f".tmp_{p.name}_", delete=False
+    ) as fh:
+        tmp_path = pathlib.Path(fh.name)
+        fh.write(text)
+    try:
+        os.replace(tmp_path, p)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def file_head_sha(path, nbytes=512):
-    """Return SHA-256 hex digest of the leading bytes of path to detect rewrite/rotation."""
+    """Return SHA-256 hex digest of the leading nbytes of path to detect rewrite/rotation."""
+    if nbytes <= 0:
+        return None
     try:
         with open(path, "rb") as fh:
             return hashlib.sha256(fh.read(nbytes)).hexdigest()
@@ -193,21 +212,23 @@ def file_head_sha(path, nbytes=512):
         return None
 
 
-def track_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0, prev_head_sha=None):
-    """Incrementally count CHECKPOINT steps with file-identity rotation/truncation detection."""
+def _track_checkpoints_state(transcript_path, prev_count=0, prev_offset=0, prev_head_sha=None, prev_head_len=None):
+    """Incrementally count CHECKPOINT steps with exact prefix-length rotation detection."""
     if not transcript_path:
-        return prev_count, prev_offset, prev_head_sha, False
+        return prev_count, prev_offset, prev_head_sha, prev_head_len or 0, False
     tp = pathlib.Path(transcript_path)
     if not tp.is_file():
-        return 0, 0, None, False
+        return 0, 0, None, 0, False
     try:
         size = tp.stat().st_size
     except OSError:
-        return prev_count, prev_offset, prev_head_sha, False
-    cur_head_sha = file_head_sha(tp)
-    rotated = bool(prev_offset > 0 and (size < prev_offset or (prev_head_sha and cur_head_sha and cur_head_sha != prev_head_sha)))
+        return prev_count, prev_offset, prev_head_sha, prev_head_len or 0, False
+    cmp_len = prev_head_len if (isinstance(prev_head_len, int) and prev_head_len > 0) else min(prev_offset, 512)
+    cur_cmp_sha = file_head_sha(tp, cmp_len) if cmp_len > 0 else None
+    rotated = bool(prev_offset > 0 and (size < prev_offset or (prev_head_sha and cur_cmp_sha and cur_cmp_sha != prev_head_sha)))
     if size == prev_offset and not rotated:
-        return prev_count, prev_offset, cur_head_sha, False
+        out_len = prev_head_len if (isinstance(prev_head_len, int) and prev_head_len > 0) else min(prev_offset, 512)
+        return prev_count, prev_offset, prev_head_sha or file_head_sha(tp, 512), out_len, False
     if rotated:
         prev_count, prev_offset = 0, 0
     added = 0
@@ -230,8 +251,19 @@ def track_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0, 
                 if isinstance(obj, dict) and obj.get("type") == "CHECKPOINT":
                     added += 1
     except OSError:
-        return prev_count, prev_offset, cur_head_sha, False
-    return prev_count + added, new_offset, cur_head_sha, rotated
+        out_len = prev_head_len if (isinstance(prev_head_len, int) and prev_head_len > 0) else min(prev_offset, 512)
+        return prev_count, prev_offset, prev_head_sha, out_len, False
+    new_head_len = min(new_offset, 512)
+    new_head_sha = file_head_sha(tp, new_head_len) if new_head_len > 0 else None
+    return prev_count + added, new_offset, new_head_sha, new_head_len, rotated
+
+
+def track_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0, prev_head_sha=None, prev_head_len=None):
+    """Backwards-compatible incremental checkpoint tracker returning (count, new_offset, head_sha, rotated)."""
+    cur, new_off, new_sha, _, rotated = _track_checkpoints_state(
+        transcript_path, prev_count, prev_offset, prev_head_sha, prev_head_len
+    )
+    return cur, new_off, new_sha, rotated
 
 
 def count_checkpoints_incremental(transcript_path, prev_count=0, prev_offset=0):
@@ -280,13 +312,13 @@ def cmd_session_start(args):
                 "metadata": {"user_markdown": f"> **agydw** 已載入（`{ws_label}`）— RESUME_STATE 已注入。"},
             }
         })
-    # Record initial checkpoint count + byte offset + head hash for incremental & rotation tracking
+    # Record initial checkpoint count + byte offset + exact prefix hash/len for incremental & rotation tracking
     if args.state_dir and payload.get("transcriptPath"):
         folder = pathlib.Path(args.state_dir)
         folder.mkdir(parents=True, exist_ok=True)
         meta_file = folder / f"compaction_{safe_cid(payload.get('conversationId'))}.json"
-        cur, off, hsha, _ = track_checkpoints_incremental(payload.get("transcriptPath"), 0, 0, None)
-        meta_file.write_text(json.dumps({"checkpoints": cur, "offset": off, "head_sha": hsha}), encoding="utf-8")
+        cur, off, hsha, hlen, _ = _track_checkpoints_state(payload.get("transcriptPath"), 0, 0, None, None)
+        _write_text_atomic(meta_file, json.dumps({"checkpoints": cur, "offset": off, "head_sha": hsha, "head_len": hlen}))
     print(json.dumps({"injectSteps": steps} if steps else {}, ensure_ascii=False))
     return 0
 
@@ -330,7 +362,7 @@ def cmd_post_tool(args):
                 )
                 stamps = []
             state[key] = stamps
-            poll_path.write_text(json.dumps(state), encoding="utf-8")
+            _write_text_atomic(poll_path, json.dumps(state))
 
         # 2. Prompt-injection scanner on tool output from transcriptPath
         if args.inject_scan and payload.get("transcriptPath"):
@@ -360,14 +392,17 @@ def cmd_pre_invocation(args):
             prev = int(meta.get("checkpoints", 0))
             prev_off = int(meta.get("offset", 0))
             prev_head = meta.get("head_sha") if isinstance(meta.get("head_sha"), str) else None
+            prev_hlen = meta.get("head_len") if isinstance(meta.get("head_len"), int) else None
         except (OSError, ValueError, TypeError):
-            prev, prev_off, prev_head = 0, 0, None
-        cur, new_off, cur_head, rotated = track_checkpoints_incremental(payload.get("transcriptPath"), prev, prev_off, prev_head)
+            prev, prev_off, prev_head, prev_hlen = 0, 0, None, None
+        cur, new_off, cur_head, cur_hlen, rotated = _track_checkpoints_state(
+            payload.get("transcriptPath"), prev, prev_off, prev_head, prev_hlen
+        )
         if cur > prev or (rotated and cur > 0):
-            meta_file.write_text(json.dumps({"checkpoints": cur, "offset": new_off, "head_sha": cur_head}), encoding="utf-8")
+            _write_text_atomic(meta_file, json.dumps({"checkpoints": cur, "offset": new_off, "head_sha": cur_head, "head_len": cur_hlen}))
             messages.insert(0, "[compaction detected] " + render_resume_text(args.resume, args.max_bytes))
-        elif new_off != prev_off or cur_head != prev_head or not meta_file.is_file():
-            meta_file.write_text(json.dumps({"checkpoints": cur, "offset": new_off, "head_sha": cur_head}), encoding="utf-8")
+        elif new_off != prev_off or cur_head != prev_head or cur_hlen != prev_hlen or not meta_file.is_file():
+            _write_text_atomic(meta_file, json.dumps({"checkpoints": cur, "offset": new_off, "head_sha": cur_head, "head_len": cur_hlen}))
 
     steps = [{"systemMessage": {"systemMessage": "\n\n".join(messages)}}] if messages else []
     print(json.dumps({"injectSteps": steps} if steps else {}, ensure_ascii=False))
@@ -403,21 +438,71 @@ def _repo_head_info(repo):
     return None, None
 
 
+def _git_index_mtime(repo):
+    try:
+        dot = pathlib.Path(repo) / ".git"
+        if dot.is_dir():
+            idx = dot / "index"
+            return idx.stat().st_mtime if idx.is_file() else 0.0
+        if dot.is_file():
+            txt = dot.read_text(encoding="utf-8", errors="replace").strip()
+            m = re.match(r"gitdir:\s*(.+)", txt)
+            if m:
+                gp = pathlib.Path(m.group(1).strip())
+                gd = gp.resolve() if gp.is_absolute() else (pathlib.Path(repo) / gp).resolve()
+                idx = gd / "index"
+                return idx.stat().st_mtime if idx.is_file() else 0.0
+    except OSError:
+        pass
+    return 0.0
+
+
 def _check_resume_freshness(repo, resume_path):
-    """Check whether uncommitted workspace files OR committed HEAD are newer than resume_path."""
+    """Check whether uncommitted workspace files (incl. spaces/UTF-8/deletes) OR committed HEAD are newer."""
     if not resume_path.is_file():
         return True, "RESUME_STATE.md does not exist yet", "missing"
     resume_mtime = resume_path.stat().st_mtime
     resume_txt = resume_path.read_text(encoding="utf-8-sig", errors="replace")
+    dirty_entries = []
     try:
-        proc = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, timeout=5)
-        dirty = [line[3:].strip().split(" -> ")[-1] for line in proc.stdout.splitlines() if line.strip()] if proc.returncode == 0 else []
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "-c", "core.quotepath=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            capture_output=True,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            tokens = proc.stdout.split(b"\x00")
+            i = 0
+            while i < len(tokens):
+                rec = tokens[i]
+                if not rec or len(rec) < 4:
+                    i += 1
+                    continue
+                xy = rec[:2].decode("ascii", errors="replace")
+                rel1 = rec[3:].decode("utf-8", errors="replace")
+                if xy[0] in ("R", "C") or xy[1] in ("R", "C"):
+                    rel2 = tokens[i + 1].decode("utf-8", errors="replace") if i + 1 < len(tokens) else None
+                    dirty_entries.append((xy, rel1))
+                    if rel2:
+                        dirty_entries.append((xy, rel2))
+                    i += 2
+                else:
+                    dirty_entries.append((xy, rel1))
+                    i += 1
     except (OSError, subprocess.SubprocessError):
-        dirty = []
-    for rel in dirty:
+        dirty_entries = []
+
+    idx_mtime = _git_index_mtime(repo) if dirty_entries else 0.0
+    for xy, rel in dirty_entries:
         fp = pathlib.Path(repo) / rel
-        if fp.is_file() and fp.resolve() != resume_path.resolve() and fp.stat().st_mtime > resume_mtime + 2:
-            return True, f"workspace file `{rel}` was modified after {resume_path.name}", f"dirty:{rel}:{int(fp.stat().st_mtime)}"
+        if fp.is_file():
+            if fp.resolve() != resume_path.resolve() and fp.stat().st_mtime > resume_mtime + 2:
+                return True, f"workspace file `{rel}` was modified after {resume_path.name}", f"dirty:{rel}:{int(fp.stat().st_mtime)}"
+        elif "D" in xy or "R" in xy or "C" in xy:
+            par_mtime = fp.parent.stat().st_mtime if fp.parent.is_dir() else 0.0
+            ref_ts = max(par_mtime, idx_mtime)
+            if ref_ts > resume_mtime + 2:
+                return True, f"workspace file `{rel}` was deleted or renamed after {resume_path.name}", f"removed:{rel}:{int(ref_ts)}"
 
     head_sha, head_ts = _repo_head_info(repo)
     if head_sha:
@@ -449,7 +534,7 @@ def _stop_already_blocked(state_dir, conv_id, fp):
         old = {}
     if old.get("fingerprint") == fp:
         return True
-    rec.write_text(json.dumps({"fingerprint": fp}), encoding="utf-8")
+    _write_text_atomic(rec, json.dumps({"fingerprint": fp}))
     return False
 
 

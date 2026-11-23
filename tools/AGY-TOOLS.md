@@ -1,6 +1,6 @@
 # agydw tools
 
-`agy-DIRECTOR-WORKER`（簡稱 `agydw`，`2.6.0-agy.4`）在 Google Antigravity（App 2.0 / `agy` CLI / IDE / SDK）上的工具手冊。`tools/` 目錄內含 **40 支 `.py` 工具腳本＋2 份 `.json` 設定檔**，全部工具只使用 Python 3.9+ 標準函式庫，不需 `pip install`；一律用以下方式執行（`-B` 不留 `__pycache__`、`-I` 隔離匯入；Linux / macOS 若未設 `python` 別名請改用 `python3`）：
+`agy-DIRECTOR-WORKER`（簡稱 `agydw`，`2.6.0-agy.5`）在 Google Antigravity（App 2.0 / `agy` CLI / IDE / SDK）上的工具手冊。`tools/` 目錄內含 **40 支 `.py` 工具腳本＋2 份 `.json` 設定檔**，全部工具只使用 Python 3.9+ 標準函式庫，不需 `pip install`；一律用以下方式執行（`-B` 不留 `__pycache__`、`-I` 隔離匯入；Linux / macOS 若未設 `python` 別名請改用 `python3`）：
 
 ```text
 python -B -I -X utf8 tools/<tool>.py ...

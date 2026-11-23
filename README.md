@@ -160,12 +160,12 @@ flowchart LR
 ## 常用指令速查（給總監與進階玩家）
 
 ```text
-# 1. 一鍵替專案安裝／升級 agydw（原子預檢＋每專案獨立 DIRECTOR-<repo>＋非破壞合併；Linux 無 python 別名請改用 python3）
+# 1. 一鍵替專案安裝／升級 agydw（原子預檢＋專案鎖保護讀改寫＋保留既有停用 Hook；Linux 無 python 別名請改用 python3）
 python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --init-director --apply
-# （第 2 步：註冊總監對話 ID 到 .sessions.json；自動保留既有 --guard-mode／--enforce-resume／自訂 --audit-log 且具並行鎖保護）
+# （第 2 步：註冊總監對話 ID 到 .sessions.json；支援 --no-enforce-resume／--no-overwrite-utf8／--copy-tools 明確關閉既定開關）
 python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --register-director <CONVERSATION_ID> --apply
 
-# 2. 環境與外掛健康檢查（含官方 Plugin Schema 檢查、啟用與 matcher 檢核、真實 Shell Hook 執行測試）
+# 2. 環境與外掛健康檢查（完全只讀：Shell Probe 自動隔離暫存 audit／bridge／pause 不寫入工作區）
 python -B -I -X utf8 <RULES>/tools/agy_doctor.py --repo <REPO> --plugin <RULES>/plugin/director-work --probe-hooks
 
 # 3. 檢查 DIRECTOR/ 與工作區 .agents/ 設定一致性與專案歸屬

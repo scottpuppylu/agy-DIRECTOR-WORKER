@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Antigravity hash-chained action audit & loop/injection scanner (2.6.0-agy.4).
+"""Antigravity hash-chained action audit & loop/injection scanner (2.6.0-agy.5).
 
 Reuses upstream tools/audit_log.py (hash chain, locking, verification), tools/loop_guard.py
 (loop detection), tools/inject_scan.py (prompt injection scanning), and tools/secret_mask.py
@@ -31,8 +31,9 @@ import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-REBUILD_VERSION = "2.6.0-agy.4"
+REBUILD_VERSION = "2.6.0-agy.5"
 READ_TOOLS = {"read_file", "view_file", "list_dir"}
+SHELL_TOOL_NAMES = {"run_command", "bash", "powershell", "monitor"}
 SUBAGENT_TOOLS = {"invoke_subagent", "swarm", "Agent", "Task"}
 TERMINAL_OK_STATUSES = {"DONE", "OK", "SUCCEEDED", "SUCCESS", "COMPLETED"}
 NONTERMINAL_STATUSES = {"RUNNING", "PENDING", "IN_PROGRESS", "QUEUED", "STARTED", "WAITING"}
@@ -40,8 +41,9 @@ ERROR_STATUSES = {"ERROR", "FAILED", "FAIL", "TIMED_OUT", "TIMEOUT"}
 INTERRUPTED_STATUSES = {"CANCELED", "CANCELLED", "INTERRUPTED", "ABORTED"}
 CREATED_RE = re.compile(r"^Created At:\s*(\S+)", re.M)
 COMPLETED_RE = re.compile(r"^Completed At:\s*(\S+)", re.M)
-EXIT_NONZERO_RE = re.compile(r"Command exited with code (-?[1-9]\d*)\.")
-EXIT_ZERO_RE = re.compile(r"Command exited with code 0\.")
+EXIT_NONZERO_RE = re.compile(r"^Command exited with code (-?[1-9]\d*)\.\s*$", re.M)
+EXIT_ZERO_RE = re.compile(r"^Command exited with code 0\.\s*$", re.M)
+OUTPUT_SECTION_RE = re.compile(r"\r?\n(?:Command output|Output):\s*(?:\r?\n|$)")
 STILL_RUNNING_RE = re.compile(r"\b(?:process still running|command is still running|running in background)\b", re.I)
 SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([0-9a-f-]{8,})"')
 
@@ -117,26 +119,41 @@ def parse_iso(text):
         return None
 
 
-def classify_step_outcome(status_val, content, err=None):
-    """Classify terminal outcomes explicitly; keep RUNNING/non-terminal distinct from ok."""
+def _extract_shell_header(body):
+    """Return only the Antigravity step header before stdout/Command output so body text never skews exit status."""
+    if not body:
+        return ""
+    parts = OUTPUT_SECTION_RE.split(body, maxsplit=1)
+    return parts[0]
+
+
+def classify_step_outcome(status_val, content, err=None, is_shell=True):
+    """Classify terminal outcomes explicitly; only inspect shell exit headers for shell calls."""
     if err:
         return "failure", "error"
     st = str(status_val).strip().upper() if status_val is not None else ""
     body = content if isinstance(content, str) else ""
     if st in INTERRUPTED_STATUSES:
         return "failure", "interrupted"
-    if st in ERROR_STATUSES or (body and EXIT_NONZERO_RE.search(body)):
+    if st in ERROR_STATUSES:
         return "failure", "error"
-    if st in NONTERMINAL_STATUSES or (body and STILL_RUNNING_RE.search(body) and not EXIT_ZERO_RE.search(body)):
+    if is_shell:
+        header = _extract_shell_header(body)
+        if header and EXIT_NONZERO_RE.search(header):
+            return "failure", "error"
+        if st in NONTERMINAL_STATUSES or (header and STILL_RUNNING_RE.search(header) and not EXIT_ZERO_RE.search(header)):
+            return "result", "running"
+    elif st in NONTERMINAL_STATUSES:
         return "result", "running"
     if st in TERMINAL_OK_STATUSES:
         return "result", "ok"
-    if st == "":
-        return ("result", "ok") if (body and EXIT_ZERO_RE.search(body)) else ("result", "unverified")
+    if st == "" and is_shell:
+        header = _extract_shell_header(body)
+        return ("result", "ok") if (header and EXIT_ZERO_RE.search(header)) else ("result", "unverified")
     return "result", "unverified"
 
 
-def parse_step_timing_and_error(content, status):
+def parse_step_timing_and_error(content, status, is_shell=True):
     """Extract duration_ms and error status from an Antigravity GENERIC step body."""
     duration_ms = None
     m1, m2 = CREATED_RE.search(content), COMPLETED_RE.search(content)
@@ -144,7 +161,7 @@ def parse_step_timing_and_error(content, status):
         t1, t2 = parse_iso(m1.group(1)), parse_iso(m2.group(1))
         if t1 and t2:
             duration_ms = max(0, int((t2 - t1).total_seconds() * 1000))
-    _, res_status = classify_step_outcome(status, content)
+    _, res_status = classify_step_outcome(status, content, is_shell=is_shell)
     is_err = (res_status == "error")
     is_int = (res_status == "interrupted")
     return duration_ms, is_err, is_int
@@ -385,13 +402,15 @@ def _build_call_record(conv_id, parent_cid, model_seen, tc, tc_id, p_step, p_ts,
         raw_args = parse_raw_args(tc)
         tool, tool_raw, norm_input = normalize_tool_and_input(raw_name, raw_args)
     else:
+        raw_name = ""
         tool = "?"
         tool_raw = "unmatched_result"
         norm_input = {"unmatched_tool_call_id": tc_id} if tc_id else {"unmatched_step_index": st.get("step_index")}
     content = st.get("content") or ""
     status_val = st.get("status")
-    dur, is_err, is_int = parse_step_timing_and_error(content, status_val)
-    kind, res_status = classify_step_outcome(status_val, content)
+    is_shell = (raw_name.lower() in SHELL_TOOL_NAMES) or (tool.lower() in SHELL_TOOL_NAMES) or (orphan and EXIT_ZERO_RE.search(_extract_shell_header(content)) is not None) or (orphan and EXIT_NONZERO_RE.search(_extract_shell_header(content)) is not None)
+    dur, is_err, is_int = parse_step_timing_and_error(content, status_val, is_shell=is_shell)
+    kind, res_status = classify_step_outcome(status_val, content, is_shell=is_shell)
     ts_str = st.get("created_at") or p_ts
     return {
         "conv_id": conv_id,
@@ -501,6 +520,80 @@ def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
     return calls, no_result, tp
 
 
+def _find_git_root_and_common(start_path):
+    """Walk ancestors for .git dir or linked-worktree .git file without spawning git."""
+    try:
+        cur = pathlib.Path(start_path).resolve()
+    except OSError:
+        return None, None, False
+    if cur.is_file():
+        cur = cur.parent
+    for cand in (cur, *cur.parents):
+        dot = cand / ".git"
+        if dot.is_dir():
+            return cand, dot.resolve(), False
+        if dot.is_file():
+            try:
+                txt = dot.read_text(encoding="utf-8", errors="replace").strip()
+                m = re.match(r"gitdir:\s*(.+)", txt)
+                if m:
+                    gp = pathlib.Path(m.group(1).strip())
+                    gd = gp.resolve() if gp.is_absolute() else (cand / gp).resolve()
+                    cd_file = gd / "commondir"
+                    if cd_file.is_file():
+                        rel = cd_file.read_text(encoding="utf-8", errors="replace").strip()
+                        cp = pathlib.Path(rel)
+                        cd = cp.resolve() if cp.is_absolute() else (gd / cp).resolve()
+                        return cand, cd, True
+                    return cand, gd, True
+            except OSError:
+                return cand, None, True
+    return None, None, False
+
+
+def resolve_worktree_audit_path(log_template, payload, audit_mod, tool_cwd=None):
+    """Expand {worktree} uniformly across PreToolUse/PostToolUse and distinguish linked worktrees."""
+    tpl = str(log_template)
+    if "{worktree}" in tpl and not os.environ.get("DW_WORKER_NAME"):
+        ws = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
+        ws_dir = next((w for w in ws if isinstance(w, str) and w.strip() and pathlib.Path(w).exists()), None)
+        p_cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) and payload.get("cwd").strip() and pathlib.Path(payload["cwd"]).exists() else None
+        base_dir = ws_dir or p_cwd or os.getcwd()
+        chosen_dir = None
+        if base_dir:
+            b_root, b_common, b_linked = _find_git_root_and_common(base_dir)
+            if isinstance(tool_cwd, str) and tool_cwd.strip() and pathlib.Path(tool_cwd).exists():
+                t_root, t_common, t_linked = _find_git_root_and_common(tool_cwd)
+                if b_common is None or (t_common is not None and os.path.normcase(t_common.as_posix()) == os.path.normcase(b_common.as_posix())):
+                    chosen_dir = (t_root or pathlib.Path(tool_cwd).resolve(), t_linked)
+                else:
+                    chosen_dir = (b_root or pathlib.Path(base_dir).resolve(), b_linked)
+            else:
+                if b_root is not None:
+                    chosen_dir = (b_root, b_linked)
+                else:
+                    bp = pathlib.Path(base_dir).resolve()
+                    chosen_dir = (bp.parent if bp.name == ".agents" and bp.parent.is_dir() else bp, False)
+        elif isinstance(tool_cwd, str) and tool_cwd.strip() and pathlib.Path(tool_cwd).exists():
+            t_root, _, t_linked = _find_git_root_and_common(tool_cwd)
+            if t_root is not None:
+                chosen_dir = (t_root, t_linked)
+            else:
+                tp = pathlib.Path(tool_cwd).resolve()
+                chosen_dir = (tp.parent if tp.name == ".agents" and tp.parent.is_dir() else tp, False)
+        if chosen_dir is not None:
+            wt_root, is_linked = chosen_dir
+            wt_base = audit_mod.safe_name(wt_root.resolve().name)
+            if is_linked:
+                h6 = hashlib.sha256(os.path.normcase(wt_root.resolve().as_posix()).encode("utf-8")).hexdigest()[:6]
+                wt_id = f"{wt_base}-{h6}"
+            else:
+                wt_id = wt_base
+            tpl = tpl.replace("{worktree}", wt_id)
+    folder_fallback = payload.get("cwd") or (payload.get("workspacePaths") or [None])[0]
+    return audit_mod.expand(tpl, folder=folder_fallback)
+
+
 def cmd_hook_append(args):
     """Handle Antigravity PostToolUse hook: append hash-chained entry and output '{}'."""
     audit = load_sibling("audit_log")
@@ -518,6 +611,7 @@ def cmd_hook_append(args):
     raw_name = tc.get("name") if isinstance(tc.get("name"), str) else "?"
     raw_args = parse_raw_args(tc)
     tool, tool_raw, norm_input = normalize_tool_and_input(raw_name, raw_args)
+    is_shell = (raw_name.lower() in SHELL_TOOL_NAMES) or (tool.lower() in SHELL_TOOL_NAMES)
 
     step_idx = payload.get("stepIdx")
     conv_id = payload.get("conversationId") if isinstance(payload.get("conversationId"), str) else None
@@ -537,7 +631,7 @@ def cmd_hook_append(args):
         kind = "failure"
         res = audit.output_record("error", err)
     elif found_step:
-        kind, res_status = classify_step_outcome(step_status, body)
+        kind, res_status = classify_step_outcome(step_status, body, is_shell=is_shell)
         res = audit.output_record(res_status, body)
     else:
         # Honest reporting: never claim status=ok when neither error nor matching tool output was observed
@@ -556,7 +650,8 @@ def cmd_hook_append(args):
         "duration_ms": None,
     }
     try:
-        target = audit.expand(args.log, folder=(payload.get("cwd") or (payload.get("workspacePaths") or [None])[0]))
+        tool_cwd = unwrap_arg_value(raw_args.get("Cwd") or raw_args.get("cwd") or raw_args.get("workspace")) if isinstance(raw_args, dict) else None
+        target = resolve_worktree_audit_path(args.log, payload, audit, tool_cwd=tool_cwd)
         audit.append_entry(target, fields)
     except (audit.AuditError, ValueError, OSError) as exc:
         print(f"agy_audit hook-append error: {exc}", file=sys.stderr)

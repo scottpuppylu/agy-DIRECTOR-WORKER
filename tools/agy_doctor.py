@@ -23,9 +23,11 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -84,9 +86,10 @@ def check_os_sandbox():
                       "Linux user namespaces available" if ns_ok else "/proc/self/ns/user missing")
 
 
-def _run_shell_hook(cmd_line, cwd_dir, payload):
+def _run_shell_hook(cmd_line, cwd_dir, payload, extra_env=None):
     """Invoke a configured hook command identically to Antigravity on the host OS."""
     inp = json.dumps(payload, ensure_ascii=False)
+    env = dict(os.environ, **(extra_env or {}))
     try:
         if os.name == "nt":
             return subprocess.run(
@@ -97,6 +100,7 @@ def _run_shell_hook(cmd_line, cwd_dir, payload):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=env,
                 timeout=20,
             )
         return subprocess.run(
@@ -107,14 +111,38 @@ def _run_shell_hook(cmd_line, cwd_dir, payload):
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
             timeout=20,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return exc
 
 
+def _quote_probe_path(p):
+    s = pathlib.Path(p).resolve().as_posix()
+    if re.fullmatch(r"[A-Za-z0-9_./:{}-]+", s):
+        return s
+    return f'"{s}"' if os.name == "nt" else shlex.quote(s)
+
+
+def _sanitize_probe_cmd(cmd_line, probe_dir):
+    """Redirect stateful guard flags (--audit/--bridge-state/--pause-flag) into disposable temp storage."""
+    repl = {
+        "--audit": _quote_probe_path(probe_dir / "probe_audit.jsonl"),
+        "--bridge-state": _quote_probe_path(probe_dir / "probe_bridge"),
+        "--pause-flag": _quote_probe_path(probe_dir / "probe_pause.flag"),
+    }
+
+    def _sub(m):
+        opt = m.group(1).lower()
+        sep = m.group(2)
+        return f"{m.group(1)}{sep}{repl[opt]}"
+
+    return re.sub(r'(--(?:audit|bridge-state|pause-flag))(=|\s+)(?:"[^"]*"|\'[^\']*\'|\S+)', _sub, cmd_line, flags=re.I)
+
+
 def _probe_pretool_command(check_name, cmd_line, cwd_dir, mode="remind"):
-    """Live-execute an extracted PreToolUse hook command against deny/allow/G01 cases."""
+    """Live-execute an extracted PreToolUse hook command in read-only probe mode against deny/allow/G01."""
     cases = [
         ("deny_env_read", {"toolCall": {"name": "read_file", "args": {"Path": ".env"}}, "hookEventName": "PreToolUse"}, "deny", None),
         ("allow_status", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}, "hookEventName": "PreToolUse"}, "allow", None),
@@ -124,23 +152,26 @@ def _probe_pretool_command(check_name, cmd_line, cwd_dir, mode="remind"):
     cases.append(
         ("g01_force_push", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git push --force origin main"}}, "hookEventName": "PreToolUse"}, g01_expected, g01_substr)
     )
-    for cname, payload, expected_dec, want_substr in cases:
-        proc = _run_shell_hook(cmd_line, cwd_dir, payload)
-        if isinstance(proc, Exception):
-            return check_item(check_name, "FAIL", f"{cname}: hook execution failed: {proc}")
-        try:
-            res = json.loads(proc.stdout.strip())
-            got = res.get("decision")
-            reason = str(res.get("reason") or "")
-        except ValueError:
-            got, reason = None, ""
-        if proc.returncode != 0 or got != expected_dec or (want_substr and want_substr not in reason):
-            return check_item(
-                check_name,
-                "FAIL",
-                f"{cname}: expected decision={expected_dec!r}" + (f" reason~={want_substr!r}" if want_substr else "")
-                + f" rc=0, got decision={got!r} reason={reason!r} rc={proc.returncode} stderr={proc.stderr.strip()[:120]}",
-            )
+    with tempfile.TemporaryDirectory(prefix="agydw_doctor_probe_") as td:
+        probe_cmd = _sanitize_probe_cmd(cmd_line, pathlib.Path(td))
+        probe_env = {"AGYDW_DOCTOR_PROBE": "1"}
+        for cname, payload, expected_dec, want_substr in cases:
+            proc = _run_shell_hook(probe_cmd, cwd_dir, payload, extra_env=probe_env)
+            if isinstance(proc, Exception):
+                return check_item(check_name, "FAIL", f"{cname}: hook execution failed: {proc}")
+            try:
+                res = json.loads(proc.stdout.strip())
+                got = res.get("decision")
+                reason = str(res.get("reason") or "")
+            except ValueError:
+                got, reason = None, ""
+            if proc.returncode != 0 or got != expected_dec or (want_substr and want_substr not in reason):
+                return check_item(
+                    check_name,
+                    "FAIL",
+                    f"{cname}: expected decision={expected_dec!r}" + (f" reason~={want_substr!r}" if want_substr else "")
+                    + f" rc=0, got decision={got!r} reason={reason!r} rc={proc.returncode} stderr={proc.stderr.strip()[:120]}",
+                )
     return check_item(
         check_name,
         "HOOK_EXEC_OK",

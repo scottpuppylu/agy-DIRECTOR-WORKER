@@ -2,9 +2,10 @@
 """Self-contained PreToolUse seatbelt entrypoint for plugin/director-work.
 
 Runs inside an isolated standalone copy of `plugin/director-work/` without needing
-`../../tools/` to exist. When full `agy_guard.py` + `guard_rules.json` are discovered
-(in `<workspace>/../DIRECTOR/tools/` or `<plugin_dir>/../../tools/`), delegates directly
-to `agy_guard.py`; otherwise evaluates core G00/G01/G02/G43/G50-G53 rules with stdlib only.
+`../../tools/` to exist. Only trusts full `agy_guard.py` + `guard_rules.json` when
+co-located inside this plugin's own distribution (`<plugin_dir>/../../tools/`),
+never loading scripts from workspace directories; otherwise evaluates core
+G00/G01/G02/G43/G50-G53 rules with stdlib only and fails closed on errors.
 """
 import argparse
 import json
@@ -55,43 +56,26 @@ def parse_args_dict(tc):
     return raw if isinstance(raw, dict) else {}
 
 
-def find_full_guard(payload):
-    """Locate (agy_guard.py, guard_rules.json) if installed alongside workspace DIRECTOR-<repo>/, DIRECTOR/, or repo."""
-    candidates = []
-    ws = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
-    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
-    roots = [r for r in (ws[0] if ws and isinstance(ws[0], str) else None, cwd) if r]
-    for root in roots:
-        p = pathlib.Path(root)
-        ascii_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", p.name).strip("-") or "project"
-        dir_candidates = [p.parent / f"DIRECTOR-{ascii_slug}", p.parent / "DIRECTOR", p / "DIRECTOR"]
-        for d_cand in sorted(p.parent.glob(f"DIRECTOR-{ascii_slug}*")) if p.parent.is_dir() else []:
-            if d_cand not in dir_candidates and d_cand.is_dir():
-                dir_candidates.append(d_cand)
-        for ddir in dir_candidates:
-            st_file = ddir / ".agydw_setup_state.json"
-            if st_file.is_file():
-                try:
-                    atd = json.loads(st_file.read_text(encoding="utf-8-sig")).get("active_tools_dir")
-                    if isinstance(atd, str) and atd.strip():
-                        candidates.append(pathlib.Path(atd))
-                except (OSError, ValueError):
-                    pass
-            for vd in sorted(ddir.glob("tools_v*"), reverse=True) if ddir.is_dir() else []:
-                if vd.is_dir():
-                    candidates.append(vd)
-            candidates.append(ddir / "tools")
-    candidates.append(PLUGIN_DIR.parent.parent / "tools")
-    for folder in candidates:
-        g = folder / "agy_guard.py"
-        r = folder / "guard_rules.json"
-        if g.is_file() and r.is_file():
-            return g, r
+def find_full_guard(payload=None):
+    """Locate (agy_guard.py, guard_rules.json) strictly inside this plugin's own trusted parent tree."""
+    folder = PLUGIN_DIR.parent.parent / "tools"
+    g = folder / "agy_guard.py"
+    r = folder / "guard_rules.json"
+    if g.is_file() and r.is_file():
+        return g, r
     return None, None
 
 
 def norm_path(val):
     return str(val).replace("\\", "/").strip()
+
+
+def _collect_string_list(val):
+    if isinstance(val, str) and val.strip():
+        return [val.strip()]
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if isinstance(x, str) and x.strip()]
+    return []
 
 
 def emit_agy(decision, reason=None):
@@ -110,13 +94,30 @@ def fallback_eval(payload, raw_stdin, profile, mode, fmt="auto"):
         args = parse_args_dict(tc)
         low = name.lower()
         cmd = next((str(args[k]) for k in ("CommandLine", "command") if isinstance(args.get(k), str)), "")
-        path = next((norm_path(args[k]) for k in ("Path", "AbsolutePath", "TargetFile", "DirectoryPath", "file_path") if isinstance(args.get(k), str) and args.get(k)), "")
+        path = next(
+            (norm_path(args[k]) for k in ("Path", "AbsolutePath", "TargetFile", "DirectoryPath", "SearchPath", "SearchDirectory", "file_path", "path") if isinstance(args.get(k), str) and args.get(k).strip()),
+            "",
+        )
+        pat_candidates = []
+        for k in ("SearchPath", "SearchDirectory", "Pattern", "pattern", "glob", "Includes"):
+            pat_candidates.extend(norm_path(x) for x in _collect_string_list(args.get(k)))
+        if path and pat_candidates:
+            base = path.rstrip("/")
+            combined = []
+            for p_item in pat_candidates:
+                if p_item == path:
+                    continue
+                combined.append(f"{base}/{p_item.lstrip('*/')}")
+                combined.append(f"{base}/{p_item.lstrip('/')}")
+            pat_candidates.extend(combined)
+        read_candidates = ([path] if path else []) + pat_candidates
     else:
         name = str(payload.get("tool_name") or "")
         args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
         low = name.lower()
         cmd = str(args.get("command") or "")
-        path = norm_path(args.get("file_path") or "") if isinstance(args.get("file_path"), str) else ""
+        path = next((norm_path(args[k]) for k in ("file_path", "path") if isinstance(args.get(k), str) and args.get(k).strip()), "")
+        read_candidates = [norm_path(args[k]) for k in ("file_path", "path", "pattern", "glob") if isinstance(args.get(k), str) and args.get(k).strip()]
 
     write_tool = low in ("write_file", "write_to_file", "edit_file", "replace_file_content", "multi_replace_file_content", "write", "edit")
     read_tool = low in ("read_file", "view_file", "list_dir", "grep_search", "find_by_name", "read", "grep", "glob")
@@ -124,7 +125,7 @@ def fallback_eval(payload, raw_stdin, profile, mode, fmt="auto"):
     hard_rule = None
     if write_tool and path and (path.endswith("/scripts/seatbelt_hook.py") or path.endswith("/plugin/director-work/hooks.json") or path.endswith("/hooks.json") and "director-work" in path):
         hard_rule = ("G00", "hook guard scripts and hooks.json cannot be edited inside a guarded session (docs/08)")
-    elif (read_tool and path and any(rx.search(path) for rx in SECRET_PATH_RES)) or (cmd and SECRET_CMD_RE.search(cmd)):
+    elif (read_tool and any(rx.search(np) for np in read_candidates for rx in SECRET_PATH_RES)) or (cmd and SECRET_CMD_RE.search(cmd)):
         hard_rule = ("G50", "secret or credential file access is denied in guarded sessions (docs/08)")
 
     if hard_rule:
@@ -164,6 +165,14 @@ def fallback_eval(payload, raw_stdin, profile, mode, fmt="auto"):
     return emit_agy("allow") if is_agy else 0
 
 
+def _fail_closed(is_agy, reason):
+    msg = f"BLOCKED by plugin seatbelt [internal]: {reason}"
+    if is_agy:
+        return emit_agy("deny", msg)
+    print(msg, file=sys.stderr)
+    return 2
+
+
 def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -173,32 +182,58 @@ def main(argv=None):
     ap.add_argument("--format", choices=("auto", "antigravity", "claude"), default="auto")
     a, extra = ap.parse_known_args(argv)
 
-    raw_stdin = sys.stdin.read() if sys.stdin is not None else ""
+    is_agy_hint = (a.format != "claude")
     try:
-        payload = json.loads(raw_stdin) if raw_stdin.strip() else {}
-    except ValueError:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
+        raw_stdin = sys.stdin.read() if sys.stdin is not None else ""
+        if not raw_stdin.strip():
+            return _fail_closed(is_agy_hint, "empty hook stdin payload")
+        try:
+            payload = json.loads(raw_stdin)
+        except ValueError as exc:
+            return _fail_closed(is_agy_hint, f"malformed hook JSON input ({exc})")
+        if not isinstance(payload, dict):
+            return _fail_closed(is_agy_hint, "hook payload must be a JSON object")
 
-    guard_py, rules_json = find_full_guard(payload)
-    if guard_py and rules_json:
-        proc = subprocess.run(
-            [sys.executable, "-B", "-I", "-X", "utf8", str(guard_py), "--rules", str(rules_json), "--profile", a.profile, "--mode", a.mode, "--format", a.format] + extra,
-            input=raw_stdin,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=25,
+        is_agy = (a.format == "antigravity") or (
+            a.format == "auto" and (not raw_stdin.strip() or "toolCall" in payload or "hookEventName" in payload or "workspacePaths" in payload)
         )
-        if proc.stdout:
-            sys.stdout.write(proc.stdout)
-        if proc.stderr:
-            sys.stderr.write(proc.stderr)
-        return proc.returncode
+        guard_py, rules_json = find_full_guard(payload)
+        if guard_py and rules_json:
+            proc = subprocess.run(
+                [sys.executable, "-B", "-I", "-X", "utf8", str(guard_py), "--rules", str(rules_json), "--profile", a.profile, "--mode", a.mode, "--format", a.format] + extra,
+                input=raw_stdin,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=12,
+            )
+            if proc.returncode != 0:
+                if not is_agy:
+                    if proc.stdout:
+                        sys.stdout.write(proc.stdout)
+                    if proc.stderr:
+                        sys.stderr.write(proc.stderr)
+                    return proc.returncode
+                if proc.stderr:
+                    sys.stderr.write(proc.stderr)
+                return _fail_closed(True, f"delegated agy_guard exited {proc.returncode}")
+            if is_agy:
+                try:
+                    parsed = json.loads((proc.stdout or "").strip())
+                except ValueError:
+                    parsed = None
+                if not isinstance(parsed, dict) or not parsed.get("decision"):
+                    return _fail_closed(True, "delegated agy_guard returned invalid JSON")
+            if proc.stdout:
+                sys.stdout.write(proc.stdout)
+            if proc.stderr:
+                sys.stderr.write(proc.stderr)
+            return proc.returncode
 
-    return fallback_eval(payload, raw_stdin, a.profile, a.mode, a.format)
+        return fallback_eval(payload, raw_stdin, a.profile, a.mode, a.format)
+    except Exception as exc:
+        return _fail_closed(is_agy_hint, f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

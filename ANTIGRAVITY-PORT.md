@@ -1,6 +1,6 @@
 # ANTIGRAVITY-PORT — `DIRECTOR-WORK v2.6.0` 到 Antigravity 的設計對照與實證紀錄
 
-本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.4`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的平台能力轉化為實質治理優勢。
+本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.5`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的平台能力轉化為實質治理優勢。
 
 ---
 
@@ -90,7 +90,7 @@
 
 - **Plugin 結構 (`plugin/director-work/`)**：
   - `plugin.json`：對齊官方 `https://antigravity.google/schemas/v1/plugin.json`（含字串 `repository` 與 `$schema`），附 3 條繁體中文建議啟動詞。
-  - `hooks.json` ＋ `scripts/seatbelt_hook.py`：外掛獨立複製時仍可開箱攔截憑證讀取與 `G00`/`G01`/`G02`，透過 `python ... || python3 ...` 相容無 `python` 別名之 POSIX 環境；若存在 `.agydw_setup_state.json`、`DIRECTOR-<repo>/tools_v*`、`DIRECTOR-<repo>/tools/` 或 repo `tools/` 則優先委派版本化 `agy_guard.py`（並透過 `.agydw_setup_state.json` 與兩階段稽核配對維持安裝升級與結果真實性）。
+  - `hooks.json` ＋ `scripts/seatbelt_hook.py`：外掛獨立複製時仍可開箱以純標準庫 fail-closed 攔截憑證讀取、`SearchPath`/`SearchDirectory`/`Includes`/`Pattern` 敏感掃描與 `G00`/`G01`/`G02`，透過 `python ... || python3 ...` 相容無 `python` 別名之 POSIX 環境；僅信任自身套件目錄上層的 `<plugin_dir>/../../tools/`（絕不執行未信任 repo 內的腳本），工作區完整治理則由 `agy_setup.py` 寫入的 `.agents/hooks.json` 直接執行。
   - `skills/`（5 個按需技能）：`dw-bootstrap`、`dw-dispatch`、`dw-review-gate`、`dw-resume`、`dw-release`。
   - `agents/`（3 個專屬子代理）：`dw-worker.md`（寫作施工）、`dw-blind-reviewer.md`（鎖定 `tools: [read_file]`、`inheritMcp: false`、`inheritCustomizations: false`）、`dw-visual-qa.md`（強調 `BROWSER_HOST_FACTS` 與跨畫面比較）。
 - **Workflow Fan-Out 範本 (`templates/workflows/`)**：
@@ -137,11 +137,13 @@
 | `agy_audit.py build`＋`audit_log.py verify` | 從真實 worker `transcript.jsonl` 重建 `34` 筆紀錄（`calls=33 no_result=0`），雜湊鏈驗證 `entries=34 head_seq=34 OK` |
 | `report_vs_audit.py` | `REPORT_VS_AUDIT: PASS claims=1 ok=1 failed=0 session=4b193101-... time_mismatch=0 not_run=0` |
 | `agy_setup_check.py --strict` | `OK`（`PENDING_METHOD`、`PO_PENDING`、`RESUME_STATE`、`.agents/` 均過關） |
-| `agy_doctor.py --probe-hooks` | `OK=14, ENFORCED=2, CONFIGURED_NOT_VERIFIED=1 (os_sandbox), WARN=0, FAIL=0, INFO=1` |
+| `agy_doctor.py --probe-hooks` | （`v2.6.0-agy.1` 歷史實測快照：`ENFORCED=2`；`v2.6.0-agy.2+` 已改採誠實狀態與無寫入探測，`WARN=0, FAIL=0`） |
+| `agy_usage` 統計快照 | 兩對話合計 `2 sessions`、`26 turns`、`39 tool_calls`、`total_tokens=1,036,189`（下文第 4 項） |
+| `selftest_agy.py --verbose` | `v2.6.0-agy.1` 初版時為 `8/8 PASS`；自 `v2.6.0-agy.5` 起擴增為 **31/31 PASS** |
 
 4. **真實 `agy_usage.py` Token 與上下文實測**：
    - **Worker（`4b193101`）**：`23 turns`、`59 steps`、`33 tool_calls`、`input_tokens=136,214`、`cache_read_tokens=796,214`、`output_tokens=21,423`、`total_tokens=953,851`、`last_prompt_tokens=57,833`、`peak_prompt_tokens=57,833`（快取命中率 `85.4%`）。
    - **唯讀盲審員（`902309a8`）**：`3 turns`、`11 steps`、`6 tool_calls`、`input_tokens=50,387`、`cache_read_tokens=23,934`、`output_tokens=8,017`、`total_tokens=82,338`、`last_prompt_tokens=31,119`（快取命中率 `32.2%`）。
    - **合計**：`2 sessions`、`26 turns`、`39 tool_calls`、`total_tokens=1,036,189`。
 5. **自檢整合回歸（`tools/selftest_agy.py --verbose`）**：
-   - 全套件 **8/8 PASS（`pass=8 skip=0 fail=0`, `exit 0`）**：涵蓋 `39/39` 上游 `v2.6.0` SHA-256 逐位元一致比對、`40` 支工具 `--help`、Windows `cmd /c` 含空白路徑掛勾執行、兩段式 `PostToolUse -> PreInvocation` 橋接、壓縮 `CHECKPOINT` 自動接回與無洩漏檢查。
+   - `v2.6.0-agy.1` 初版驗證為 8/8 PASS；目前已擴充至 **31/31 PASS（`pass=31 skip=0 fail=0`, `exit 0`）**：涵蓋 `39/39` 上游 `v2.6.0` SHA-256 逐位元一致比對、`40` 支工具 `--help`、fail-closed 外掛隔離與防 RCE、Windows `cmd /c` 含空白路徑掛勾執行、兩段式 `PostToolUse -> PreInvocation` 橋接、worktree 稽核鏈隔離、並行結構 setup 鎖與無洩漏檢查。

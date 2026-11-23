@@ -8,7 +8,7 @@
 - **訊息**：只在 gate 報告、需要決定、或要對方立刻改行動時發送（`send_message` 或 Swarm 看板）；不回 ACK；給同一人的內容一次寫完整。
 - **要 PO 回覆的事**：Worker 先回報總監（標題 `PO_REPLY_NEEDED`），由總監透過 `ask_question` 詢問 PO，並記進 `<DIRECTOR>/PO_PENDING.md`（子代理不可直接呼叫 `ask_question` 跨過總監）。
 - **上下文短與工作區隔離**：長輸出寫檔、只看結論；大量閱讀交給唯讀 `research` / `dw-blind-reviewer`，網頁與視覺檢查交給 `browser` / `dw-visual-qa`（並核對 `BROWSER_HOST_FACTS`）；過一個 gate 開新的子代理或新對話。新專案或新副本先確認 `.agents/hooks.json` 已透過 `python -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --apply` 套用；子代理寫程式碼優先使用 `workspace: "branch"` 或獨立 `git worktree`。
-- **計畫閘門與安全守護**：Standard / Strict 工單開工前，worker 先寫 `<WORK_DIR>/<TASK_ID>/PLAN.md` 送審，等總監寫入 `PLAN_APPROVED` 才動程式；Runtime `PreToolUse` hook（`agy_guard.py`）會依設定提醒或擋下越權指令、憑證讀取、破壞性 git 操作與修改 `TESTS_LOCKED`。
+- **計畫閘門與安全守護**：Standard / Strict 工單開工前，worker 先寫 `<WORK_DIR>/<TASK_ID>/PLAN.md` 送審，等總監寫入 `PLAN_APPROVED` 才動程式；Runtime `PreToolUse` hook（`agy_guard.py`）會依設定提醒或擋下越權指令、憑證讀取、破壞性 git 操作與 `--protect` 受保護路徑，`TESTS_LOCKED` 則於交件時由 `scope_check.py` / `gate_check.py` 核對驗證。
 - **品質**：工程狀態與成品狀態分開回報；數字不能代替看成品（`<本專案的成品怎麼看>`）；成品交件附常識閘門表；每個缺陷最多 3 輪假設驅動修正；不破壞已通過基準；最終驗收屬 PO，絕不自稱通過。
 - **安全**：`push`、公開、刪除、付費、帳號、使用者全域設定（如 `~/.gemini/config/config.json`）都要 PO 核准；不 force push、不 `reset --hard`、不 `git clean`、不用裸 `git stash`；不批次刪證據；只停自己的背景工作；測試輸出寫到 `<輸出位置>`，不寫進 repo。
 - **語言**：所有對人與報告內容用繁體中文；程式碼、檔名、commit 訊息、識別字可用英文。

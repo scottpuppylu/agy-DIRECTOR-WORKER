@@ -2006,6 +2006,7 @@ E2E_EXIT = re.compile(
 )
 E2E_FAIL_MARKER = re.compile(r"^[ \t]*(?:FAILED\b|FAIL\b|ERROR:|Traceback \(most recent call last\):)", re.M)
 E2E_PASS_MARKER = re.compile(r"^[ \t]*(?:RESULT|STATUS|VERDICT)[ \t]*[:=][ \t]*(?:PASS|OK|SUCCESS)\b", re.I | re.M)
+E2E_CANDIDATE_FIELD = re.compile(r"^[ \t]*(?:CANDIDATE_HEAD|CANDIDATE|COMMIT|HEAD)[ \t]*:[ \t]*([0-9a-fA-F]{7,40})\b", re.M)
 
 
 FEAS_FIELD = re.compile(r"^[ \t]*(FEASIBILITY|FEASIBLE_COUNT|SCRIPT|RESULT)[ \t]*[:=][ \t]*(.*?)[ \t]*$", re.M)
@@ -2084,8 +2085,17 @@ def feasibility_problems(path, notes):
     return problems
 
 
+def _e2e_matches_candidate(txt, candidate):
+    """Return True if E2E record has a structured candidate field matching candidate SHA, None if unbound, False if bound elsewhere."""
+    cands = [m.group(1).lower() for m in E2E_CANDIDATE_FIELD.finditer(txt)]
+    if not cands:
+        return None
+    cand_low = candidate.lower()
+    return any(cand_low.startswith(c) or c.startswith(cand_low) for c in cands)
+
+
 def final_problems(folder, notes, allow_incomplete_e2e=False, candidate=None):
-    """2.2.5 / agy.4: final acceptance of a DIRECTOR folder requiring completed E2E outcome(s)."""
+    """2.2.5 / agy.4 / agy.5: final acceptance of a DIRECTOR folder requiring candidate-scoped completed E2E outcome(s)."""
     base = pathlib.Path(folder)
     if not (base / "evidence").is_dir() and (base / "DIRECTOR").is_dir():
         base = base / "DIRECTOR"
@@ -2096,42 +2106,54 @@ def final_problems(folder, notes, allow_incomplete_e2e=False, candidate=None):
         problems.append(f"E2E: no end-to-end evidence in {e2e}; before the final verdict the lead runs the spec's "
                         "scenarios once through the product's public entry point and keeps the output there")
     else:
-        texts = [(p, read_or_none(p) or "") for p in records]
-        if not any(E2E_ENTRY.search(txt) for _, txt in texts):
-            notes.append(f"WARN E2E: no record in {e2e} names its `ENTRY_POINT:` (the one public entry point it ran)")
-        completed_texts = []
-        e2e_failed = False
-        for p, txt in texts:
-            file_failed = False
-            file_zero_exit = False
-            for xm in E2E_EXIT.finditer(txt):
-                code_str = next((g for g in xm.groups() if g is not None), None)
-                if code_str is None:
+        raw_texts = [(p, read_or_none(p) or "") for p in records]
+        texts = []
+        for p, txt in raw_texts:
+            if candidate:
+                bound = _e2e_matches_candidate(txt, candidate)
+                if bound is False:
+                    other_cands = [m.group(1) for m in E2E_CANDIDATE_FIELD.finditer(txt)]
+                    notes.append(f"INFO E2E: ignored historical record {p.name} bound to different commit ({other_cands[0][:10]})")
                     continue
-                code = int(code_str)
-                if code != 0:
-                    problems.append(f"E2E: {p.name} recorded non-zero exit code ({code})")
+            texts.append((p, txt))
+
+        if not texts:
+            problems.append(f"E2E: no end-to-end evidence in {e2e} applies to candidate commit {candidate[:12] if candidate else ''}")
+        else:
+            if not any(E2E_ENTRY.search(txt) for _, txt in texts):
+                notes.append(f"WARN E2E: no active record in {e2e} names its `ENTRY_POINT:` (the one public entry point it ran)")
+            completed_texts = []
+            e2e_failed = False
+            for p, txt in texts:
+                file_failed = False
+                file_zero_exit = False
+                for xm in E2E_EXIT.finditer(txt):
+                    code_str = next((g for g in xm.groups() if g is not None), None)
+                    if code_str is None:
+                        continue
+                    code = int(code_str)
+                    if code != 0:
+                        problems.append(f"E2E: {p.name} recorded non-zero exit code ({code})")
+                        e2e_failed = True
+                        file_failed = True
+                    else:
+                        file_zero_exit = True
+                fm = E2E_FAIL_MARKER.search(txt)
+                if fm:
+                    problems.append(f"E2E: {p.name} contains failure marker ({fm.group(0).strip()})")
                     e2e_failed = True
                     file_failed = True
+                if not file_failed and (file_zero_exit or E2E_PASS_MARKER.search(txt)):
+                    completed_texts.append((p, txt))
+            if not e2e_failed and not completed_texts:
+                msg = f"E2E_INCOMPLETE: no record in {e2e} contains an explicit completed outcome (e.g. `EXIT_CODE: 0` or `RESULT: PASS`)"
+                if allow_incomplete_e2e:
+                    notes.append(f"WARN {msg}")
                 else:
-                    file_zero_exit = True
-            fm = E2E_FAIL_MARKER.search(txt)
-            if fm:
-                problems.append(f"E2E: {p.name} contains failure marker ({fm.group(0).strip()})")
-                e2e_failed = True
-                file_failed = True
-            if not file_failed and (file_zero_exit or E2E_PASS_MARKER.search(txt)):
-                completed_texts.append((p, txt))
-        if not e2e_failed and not completed_texts:
-            msg = f"E2E_INCOMPLETE: no record in {e2e} contains an explicit completed outcome (e.g. `EXIT_CODE: 0` or `RESULT: PASS`)"
-            if allow_incomplete_e2e:
-                notes.append(f"WARN {msg}")
-            else:
-                problems.append(msg)
-        if candidate and completed_texts:
-            prefix = candidate[:7].lower()
-            if not any(prefix in txt.lower() for _, txt in completed_texts):
-                problems.append(f"E2E: no completed record in {e2e} references candidate commit {candidate[:12]}")
+                    problems.append(msg)
+            if candidate and completed_texts:
+                if not any(_e2e_matches_candidate(txt, candidate) is True for _, txt in completed_texts):
+                    problems.append(f"E2E: no completed record in {e2e} has structured COMMIT:/CANDIDATE_HEAD: matching candidate commit {candidate[:12]}")
     register = base / "DECISION_REGISTER.md"
     text = read_or_none(register) if register.is_file() else None
     if text is None:

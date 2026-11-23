@@ -17,7 +17,7 @@ description: >-
 2. **終驗與追溯**：
    - `python -B -I -X utf8 <RULES>/tools/trace_report.py --orders <DIRECTOR>/orders --reports <DIRECTOR>/reports --verdicts <DIRECTOR>/reviews --config <DIRECTOR>/director_work.json`
    - `python -B -I -X utf8 <RULES>/tools/metrics_report.py --director <DIRECTOR>`
-   - `python -B -I -X utf8 <RULES>/tools/gate_check.py --final <DIRECTOR> --usage <DIRECTOR>/usage.json`
+   - `python -B -I -X utf8 <RULES>/tools/gate_check.py --final <DIRECTOR> --usage <DIRECTOR>/usage.json --candidate <HEAD_40HEX>`
    - 確認所有工單在裁決後沒有未授權的程式提交：`python -B -I -X utf8 <RULES>/tools/gate_check.py --after-verdict <VERDICT> --repo <REPO> --orders <DIRECTOR>/orders`
    - 檢查是否仍有豁免未到期或需統一續期：`python -B -I -X utf8 <RULES>/tools/waiver.py`（可用 `--to <DATE>` 統一到期日）。
 

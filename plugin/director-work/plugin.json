@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "director-work",
   "displayName": "DIRECTOR-WORK (Antigravity)",
-  "version": "2.6.0-agy.4",
+  "version": "2.6.0-agy.5",
   "description": "Director/Worker multi-agent engineering governance for Google Antigravity: work orders, test-first safety gates, read-only blind review, lossless RESUME_STATE, and hash-chained audit.",
   "author": "scottpuppylu",
   "homepage": "https://github.com/scottpuppylu/agy-DIRECTOR-WORKER",

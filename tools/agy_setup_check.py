@@ -170,6 +170,46 @@ def validate_hooks_structure(hdata):
     return problems, pretool_cmd
 
 
+def _split_cmd_tokens(cmd_str):
+    if not cmd_str:
+        return []
+    toks, cur, quote = [], [], None
+    for ch in cmd_str:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                cur.append(ch)
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch.isspace():
+            if cur:
+                toks.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        toks.append("".join(cur))
+    return toks
+
+
+def _extract_opt(tokens, flag):
+    for i, t in enumerate(tokens):
+        if t == flag and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if t.startswith(flag + "="):
+            return t.split("=", 1)[1]
+    return None
+
+
+def _norm_audit_path_key(val):
+    try:
+        s = pathlib.Path(str(val)).resolve().as_posix()
+    except (OSError, ValueError):
+        s = str(val).replace("\\", "/")
+    return os.path.normcase(s) if os.name == "nt" else s
+
+
 def check_director(dpath, repo_path=None):
     """Return (problems, shadows, notes) for one DIRECTOR folder."""
     problems, shadows, notes = [], [], []
@@ -313,8 +353,10 @@ def check_director(dpath, repo_path=None):
                         want_mode = sstate.get("guard_mode")
                         if want_mode and f"--mode {want_mode}" not in pre_cmd:
                             problems.append(f".agents/hooks.json guard mode drifted from {setup_state_fp.name} (expected --mode {want_mode})")
-                        if sstate.get("audit_log") and str(sstate["audit_log"]) not in pre_cmd:
-                            problems.append(f".agents/hooks.json audit log drifted from {setup_state_fp.name} ({sstate['audit_log']})")
+                        if sstate.get("audit_log"):
+                            got_audit = _extract_opt(_split_cmd_tokens(pre_cmd), "--audit")
+                            if not got_audit or _norm_audit_path_key(got_audit) != _norm_audit_path_key(sstate["audit_log"]):
+                                problems.append(f".agents/hooks.json audit log drifted from {setup_state_fp.name} ({sstate['audit_log']})")
                         if sstate.get("enforce_resume"):
                             stop_cmds, _ = _extract_hook_entries((hdata.get("agydw-audit-and-bridge") or {}).get("Stop"), need_matcher=False)
                             if not any("--enforce-resume" in c for c in stop_cmds):

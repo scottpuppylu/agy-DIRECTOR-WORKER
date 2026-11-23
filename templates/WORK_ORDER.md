@@ -31,7 +31,7 @@ WORKER_LIMIT   = <80 輪或 context 60%，先到先停（預設，可改）>   #
 - 不做（OUT OF SCOPE）：<這次明確不做的範圍；沒有就寫「無」，不可留空>
 - 可呼叫的入口：<交付物是函式庫或工具時，一個公開、測試可直接呼叫的函式：輸入路徑或資料 → 輸出結果，例 `report.build(path) -> Report`；不能只能從命令列用。不是函式庫或工具就寫「不適用」>
 
-可以改和不准碰的路徑（`tools/scope_check.py` 和 `PreToolUse` hook `agy_guard.py` 讀這兩份清單）：
+可以改和不准碰的路徑（`tools/scope_check.py` 事後依 git diff 核對這兩份清單）：
 
 ```text
 SCOPE:
@@ -115,7 +115,7 @@ TESTS_LOCKED:
 ## G. 交付與停止規則
 - DELIVERABLES：<檔案、commit / tag、審查包>
 - 完成：一則完整的 TASK REPORT（`templates/TASK_REPORT.md`）送回總監（`send_message` 或子代理回報／Swarm 看板）。
-- STOP_RULES：同一根因 2 輪沒進展就停並回報（或同一錯誤達 2 次先寫明根因再決定是否重試）；超出 `SCOPE` 先問；超過測試上限 10 分鐘先停下回報。
+- STOP_RULES：同一根因 1 輪沒進展就停並回報（對齊 `director_work.json` 預設 `safety.stop_after_rounds = 1`；若專案另有設定以設定為準）；超出 `SCOPE` 先問；超過測試上限 10 分鐘先停下回報。
 - 先用 `agydw` 現有工具：檢查、比對、等待、狀態整理先找 `tools/README.md` 與 `tools/AGY-TOOLS.md`，自己寫的要說明為什麼現有工具不夠。
 - 根因研究：`ROOT_CAUSE_STUDY.md` 每一節先放「測試條件 vs 參考條件」表，再寫 WHERE / ALTERNATIVES / DECISION。
 - 放寬量測標準前先做一次盲測；確認前舊標準照用。

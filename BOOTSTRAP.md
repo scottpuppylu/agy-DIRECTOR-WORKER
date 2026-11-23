@@ -165,12 +165,12 @@ Antigravity 的全域開關位於使用者設定目錄（`~/.gemini/config/confi
 
 ## 10.5 工具衛生與安全開關
 
-確認 `<WS>/DIRECTOR/director_work.json` 裡的 `"safety"` 區塊設定正確：
-- `tests_first: true`（Standard / Strict 測試先鎖後開工）
-- `plan_gate: true`（Standard / Strict 先繳 `PLAN.md` 經 `PLAN_APPROVED` 後才改碼）
-- `spec_review: true`（Strict 必做、Standard 選用，用唯讀 `dw-blind-reviewer`）
-- `one_round_stop: true`（同一根因卡兩輪停止回報）
-- `max_files_per_order` 與 `max_lines_per_order`（預設 3 檔、200 行修改）
+確認 `<WS>/DIRECTOR/director_work.json` 裡的 `"safety"` 與 `"order_limits"` 設定正確（對齊 `director_work.example.json`）：
+- `safety.tests_first: true`（Standard / Strict 測試先鎖後開工）
+- `safety.plan_gate: true`（Standard / Strict 先繳 `PLAN.md` 經 `PLAN_APPROVED` 後才改碼）
+- `safety.spec_review_for_standard: false`（Strict 本身強迫執行規格審查；將此開關設為 `true` 時 Standard 亦同開 `dw-blind-reviewer`）
+- `safety.stop_after_rounds: 1`（同一根因卡超過指定輪數停止回報）
+- `order_limits`（頂層鍵）：`max_files_per_order`（預設 3 檔）與 `max_lines_per_order`（預設 200 行）
 安全開關只能由 PO 在對話或 `PO_PENDING.md` 親自同意才能放寬或關閉。
 
 ---
@@ -232,7 +232,7 @@ Antigravity 的全域開關位於使用者設定目錄（`~/.gemini/config/confi
 4. **重建稽核與用量**：執行 `agy_audit.py build --transcript <TRANSCRIPT> --include-subagents --out <WS>/DIRECTOR/research/audit.jsonl --force` → `agy_audit.py verify --log <WS>/DIRECTOR/research/audit.jsonl` → `report_vs_audit.py --report <REPORT> --log <WS>/DIRECTOR/research/audit.jsonl` 核對報告真實性，並跑 `agy_usage.py --project-dir <REPO> --include-subagents --loops --out <WS>/DIRECTOR/usage.json`。
 5. **最終一致性檢查**：交最後報告與送交 PO 最終驗收前，執行：
    ```text
-   python -B -I -X utf8 <RULES>/tools/gate_check.py --final <WS>/DIRECTOR --usage <WS>/DIRECTOR/usage.json
+   python -B -I -X utf8 <RULES>/tools/gate_check.py --final <WS>/DIRECTOR --usage <WS>/DIRECTOR/usage.json --candidate <CANDIDATE_HEAD_40HEX>
    ```
 
 ---

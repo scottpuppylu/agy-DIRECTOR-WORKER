@@ -35,6 +35,7 @@ AGY_INTERNAL_REPORT_TOOLS = ("send_message", "post_message", "SendMessage", "mcp
 # Antigravity-specific config/rule files (same protection policy as G40 for Claude Code files)
 AGY_CONFIG_GLOBS = [
     "**/.agents/hooks*.json",
+    "**/director-work/hooks.json",
     "**/.agents/plugins.json",
     "**/.agents/skills.json",
     "**/.agents/rules/**",
@@ -53,7 +54,7 @@ AGY_EXTRA_SECRET_GLOBS = [
     "**/.gemini/**/accounts.json",
 ]
 
-AGY_PROTECTED_FILES = ("agy_guard.py", "agy_hook_bridge.py", "agy_audit.py", "hook_guard.py", "guard_rules.json")
+AGY_PROTECTED_FILES = ("agy_guard.py", "agy_hook_bridge.py", "agy_audit.py", "seatbelt_hook.py", "hook_guard.py", "guard_rules.json")
 
 
 def load_sibling(name):
@@ -91,6 +92,17 @@ def resolve_shell_name(shell_opt):
     return "PowerShell" if os.name == "nt" else "Bash"
 
 
+def _unwrap_arg(val):
+    if isinstance(val, str):
+        s = val.strip()
+        if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or s[0] in "[{"):
+            try:
+                return json.loads(s)
+            except ValueError:
+                return val
+    return val
+
+
 def translate_antigravity_call(payload, shell_opt="auto"):
     """Translate an Antigravity PreToolUse stdin payload into canonical hook_guard dict + metadata."""
     tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
@@ -101,9 +113,10 @@ def translate_antigravity_call(payload, shell_opt="auto"):
             raw_args = json.loads(raw_args)
         except ValueError:
             raw_args = {}
-    args = raw_args if isinstance(raw_args, dict) else {}
+    args = {k: _unwrap_arg(v) for k, v in raw_args.items()} if isinstance(raw_args, dict) else {}
     ws = payload.get("workspacePaths") if isinstance(payload.get("workspacePaths"), list) else []
-    cwd = first_str(args, "Cwd", "cwd") or (payload.get("cwd") if isinstance(payload.get("cwd"), str) else None) or (ws[0] if ws and isinstance(ws[0], str) else None)
+    tool_cwd = first_str(args, "Cwd", "cwd", "workspace")
+    cwd = tool_cwd or (payload.get("cwd") if isinstance(payload.get("cwd"), str) else None) or (ws[0] if ws and isinstance(ws[0], str) else None)
     conv_id = payload.get("conversationId") if isinstance(payload.get("conversationId"), str) else None
     step_idx = payload.get("stepIdx")
 
@@ -136,11 +149,25 @@ def translate_antigravity_call(payload, shell_opt="auto"):
     elif low == "grep_search":
         canonical["tool_name"] = "Grep"
         path = first_str(args, "SearchPath", "path")
-        canonical["tool_input"] = {k: v for k, v in (("path", path), ("glob", args.get("Query"))) if v}
+        inc = args.get("Includes")
+        inc_first = inc if isinstance(inc, str) else (inc[0] if isinstance(inc, list) and inc and isinstance(inc[0], str) else None)
+        ti = {}
+        if path:
+            ti["path"] = path
+        if isinstance(args.get("Query"), str) and args["Query"]:
+            ti["pattern"] = args["Query"]
+        if inc_first:
+            ti["glob"] = inc_first
+        canonical["tool_input"] = ti
     elif low == "find_by_name":
         canonical["tool_name"] = "Glob"
         path = first_str(args, "SearchDirectory", "path")
-        canonical["tool_input"] = {k: v for k, v in (("path", path), ("pattern", args.get("Pattern"))) if v}
+        ti = {}
+        if path:
+            ti["path"] = path
+        if isinstance(args.get("Pattern"), str) and args["Pattern"]:
+            ti["pattern"] = args["Pattern"]
+        canonical["tool_input"] = ti
     elif raw_name in AGY_INTERNAL_REPORT_TOOLS:
         canonical["tool_name"] = "SendMessage"
 
@@ -158,7 +185,22 @@ def pause_allows_agy(hg, data, profile, canonical, raw_name, raw_args):
     return hg.pause_allows(data, profile, canonical)
 
 
-def agy_extra_hits(hg, data, profile, canonical, raw_name, rules_path):
+def _secret_rule_globs(data):
+    """Collect G50 secret path globs from loaded rules data."""
+    if not isinstance(data, dict):
+        return [], []
+    globs, exc = [], []
+    for r in data.get("rules") or []:
+        if r.get("id") != "G50":
+            continue
+        for m in r.get("match") if isinstance(r.get("match"), list) else ([r.get("match")] if isinstance(r.get("match"), dict) else []):
+            if isinstance(m, dict) and m.get("kind") == "path":
+                globs.extend(m.get("globs") or [])
+                exc.extend(m.get("except") or [])
+    return globs, exc
+
+
+def agy_extra_hits(hg, data, profile, canonical, raw_name, rules_path, raw_args=None):
     """Check Antigravity-specific guard rules without altering upstream guard_rules.json."""
     hits = []
     tool = canonical.get("tool_name") or ""
@@ -172,17 +214,42 @@ def agy_extra_hits(hg, data, profile, canonical, raw_name, rules_path):
     commands = list(hg.simple_commands(hg.FD_DUP.sub(" ", command), shell)) if shell_call else []
     targets = hg.redirect_targets(command, shell) if shell_call else []
 
-    file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
-    target = hg.rule_path(file_path, cwd) if isinstance(file_path, str) and file_path else None
+    raw_path = next((tool_input[f] for f in hg.PATH_FIELDS if isinstance(tool_input, dict) and isinstance(tool_input.get(f), str) and tool_input[f]), None)
+    target = hg.rule_path(raw_path, cwd) if isinstance(raw_path, str) and raw_path else None
 
-    # Protect agy_guard.py / agy_hook_bridge.py / agy_audit.py alongside G00
+    # Collect all read/search target candidates (covers path + pattern + Grep Includes list)
+    search_targets = [target] if target else []
+    if tool in ("Read", "Grep", "Glob"):
+        pat_items = []
+        if tool == "Glob" and isinstance(tool_input.get("pattern"), str) and tool_input["pattern"]:
+            pat_items.append(tool_input["pattern"])
+        if isinstance(tool_input.get("glob"), str) and tool_input["glob"]:
+            pat_items.append(tool_input["glob"])
+        if isinstance(raw_args, dict):
+            inc = raw_args.get("Includes")
+            if isinstance(inc, str) and inc.strip():
+                pat_items.append(inc.strip())
+            elif isinstance(inc, list):
+                pat_items.extend(x.strip() for x in inc if isinstance(x, str) and x.strip())
+        base_dir = raw_path or cwd or os.getcwd()
+        for pat in pat_items:
+            search_targets.append(hg.rule_path(os.path.join(base_dir, pat), cwd))
+            stripped = pat.lstrip("*")
+            if stripped != pat:
+                search_targets.append(hg.rule_path(os.path.join(base_dir, stripped), cwd))
+            search_targets.append(hg.rule_path(pat, cwd))
+
+    # Protect agy_guard.py / agy_hook_bridge.py / agy_audit.py / seatbelt_hook.py alongside G00
     protected_scripts = {hg.rule_path(str(HERE / name), None) for name in AGY_PROTECTED_FILES}
+    sb_repo = HERE.parent / "plugin" / "director-work" / "scripts" / "seatbelt_hook.py"
+    protected_scripts.add(hg.rule_path(str(sb_repo), None))
     if rules_path:
         protected_scripts.add(hg.rule_path(str(rules_path), None))
     names = {n.lower() for n in AGY_PROTECTED_FILES}
     if rules_path:
         names.add(pathlib.Path(str(rules_path)).name.lower())
-    if (tool in hg.WRITE_TOOLS and target in protected_scripts) or (shell_call and hg.self_write(commands, names, targets)):
+    is_sb_write = tool in hg.WRITE_TOOLS and target and target.endswith("/scripts/seatbelt_hook.py")
+    if (tool in hg.WRITE_TOOLS and (target in protected_scripts or is_sb_write)) or (shell_call and hg.self_write(commands, names, targets)):
         hits.append((hg.SELF_RULE["decision"][base_prof], "G00", hg.SELF_RULE["reason"]))
 
     # G43 (Antigravity config/rule files protection, analogous to G40)
@@ -193,10 +260,13 @@ def agy_extra_hits(hg, data, profile, canonical, raw_name, rules_path):
     elif shell_call and hg.shell_write_match({"globs": AGY_CONFIG_GLOBS, "except": []}, commands, targets, cwd, home, command):
         hits.append((cfg_decision, "G43", cfg_reason))
 
-    # G53 (Antigravity / Gemini OAuth & account credential files)
+    # G53 + G50 completeness on Includes list and search path combinations
     sec_reason = "credential files are not read in a session (docs/08); report what you need to the Director"
-    if tool in ("Read", "Grep", "Glob") and target and hg.globs_match(AGY_EXTRA_SECRET_GLOBS, [], target, home):
+    g50_globs, g50_exc = _secret_rule_globs(data)
+    if tool in ("Read", "Grep", "Glob") and any(t and hg.globs_match(AGY_EXTRA_SECRET_GLOBS, [], t, home) for t in search_targets):
         hits.append(("deny", "G53", sec_reason))
+    elif tool == "Grep" and g50_globs and any(t and hg.globs_match(g50_globs, g50_exc, t, home) for t in search_targets):
+        hits.append(("deny", "G50", sec_reason))
     elif shell_call:
         for _, rest in commands:
             for word in rest:
@@ -248,13 +318,42 @@ def emit_antigravity(decision, reason=None, overwrite=None):
     return 0
 
 
-def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, conv_id, agent_hint=None):
+def resolve_audit_path(audit_arg, raw_payload, tool_cwd=None):
+    """Expand {worktree} uniformly with agy_audit.py so PreToolUse and PostToolUse share one chain."""
+    if not audit_arg:
+        return None
+    if "{worktree}" not in str(audit_arg):
+        return audit_arg
+    try:
+        aud = load_sibling("audit_log")
+        agy_aud = load_sibling("agy_audit")
+        return agy_aud.resolve_worktree_audit_path(audit_arg, raw_payload or {}, aud, tool_cwd=tool_cwd)
+    except Exception:
+        return audit_arg
+
+
+def _protect_target_globs(hg, protect_dirs):
+    """Build guarded directory globs (Write/Edit + shell writes + move/delete) for non-director sessions."""
+    globs = []
+    for pdir in protect_dirs or []:
+        base_rp = hg.rule_path(str(pdir), None).rstrip("/")
+        for sub in ("DIRECTOR_LOG.md", "orders/**", "director_work.json", ".agydw_setup_state.json", ".sessions.json", "tools/**", "tools_v*/**"):
+            globs.append(f"{base_rp}/{sub}")
+    return globs
+
+
+def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, conv_id, agent_hint=None, raw_payload=None, tool_cwd=None):
     """Evaluate one translated call using hook_guard rules + Antigravity extras."""
     profile = a.profile
     if sessions is not None:
         profile = hg.session_profile(sessions, canonical, profile)
     if agent_hint and agent_hint.strip().lower() in ("dw-worker", "dw-blind-reviewer", "dw-visual-qa"):
         profile = "worker"
+
+    probe_mode = bool(getattr(a, "dry_run_probe", False) or os.environ.get("AGYDW_DOCTOR_PROBE") == "1")
+    audit_target = None if probe_mode else resolve_audit_path(a.audit, raw_payload, tool_cwd=tool_cwd)
+    bridge_target = None if probe_mode else a.bridge_state
+    pause_target = None if probe_mode else a.pause_flag
 
     if (canonical.get("tool_name") in ("Bash", "Monitor") and isinstance(canonical.get("tool_input"), dict)
             and isinstance(canonical["tool_input"].get("command"), str)):
@@ -265,7 +364,7 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
     paused = hg.pause_state(a.pause_flag) if a.pause_flag and not (sessions is not None and profile == "director") else None
     if paused and not pause_allows_agy(hg, data, profile, eval_call, raw_name, raw_args):
         msg = f"PAUSED by {paused[0]} at {paused[1]}: {paused[2]}; {data['pause']['reason']}"
-        hg.audit(a.audit, canonical, "pause", "PAUSE")
+        hg.audit(audit_target, canonical, "pause", "PAUSE")
         if fmt == "antigravity":
             return emit_antigravity("deny", msg)
         print(msg, file=sys.stderr)
@@ -275,6 +374,11 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
     file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     cwd = eval_call.get("cwd") if isinstance(eval_call.get("cwd"), str) else None
+    home_rp = hg.rule_path(str(pathlib.Path.home()), None)
+    shell = "powershell" if eval_call.get("tool_name") == "PowerShell" else "bash"
+    is_shell = eval_call.get("tool_name") in hg.SHELL_TOOLS and isinstance(command, str)
+    cmds = list(hg.simple_commands(hg.FD_DUP.sub(" ", command), shell)) if is_shell else []
+    redir_targets = hg.redirect_targets(command, shell) if is_shell else []
 
     sess_why = None
     if a.sessions and hg.base_profile(profile) != "director":
@@ -282,29 +386,32 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
         if eval_call.get("tool_name") in ("Write", "Edit") and isinstance(file_path, str) and file_path:
             if hg.canonical(file_path, cwd) == sess_canon:
                 sess_why = "sessions role map is managed by the Director/setup (docs/08); report BLOCKED instead"
-        elif eval_call.get("tool_name") in hg.SHELL_TOOLS and isinstance(command, str):
-            shell = "powershell" if eval_call.get("tool_name") == "PowerShell" else "bash"
+        elif is_shell:
             s_glob = hg.rule_path(a.sessions, None)
-            home_rp = hg.rule_path(str(pathlib.Path.home()), None)
-            cmds = list(hg.simple_commands(hg.FD_DUP.sub(" ", command), shell))
-            if hg.shell_write_match({"globs": [s_glob], "except": []}, cmds, hg.redirect_targets(command, shell), cwd, home_rp, command):
+            if hg.shell_write_match({"globs": [s_glob], "except": []}, cmds, redir_targets, cwd, home_rp, command):
                 sess_why = "sessions role map is managed by the Director/setup (docs/08); report BLOCKED instead"
 
-    if a.protect and hg.base_profile(profile) != "director" and eval_call.get("tool_name") in ("Write", "Edit") and isinstance(file_path, str) and file_path:
-        why = hg.protected_reason(file_path, cwd, a.protect)
-    elif isinstance(command, str):
-        why = hg.reason(command, "powershell" if eval_call.get("tool_name") == "PowerShell" else "bash")
-    else:
-        why = None
+    protect_why = None
+    if a.protect and hg.base_profile(profile) != "director":
+        p_globs = _protect_target_globs(hg, a.protect)
+        if eval_call.get("tool_name") in ("Write", "Edit") and isinstance(file_path, str) and file_path:
+            protect_why = hg.protected_reason(file_path, cwd, a.protect)
+            if not protect_why and hg.globs_match(p_globs, [], hg.rule_path(file_path, cwd), home_rp):
+                protect_why = "director governance configs, state files, and active tools are protected (docs/02/08); report BLOCKED instead"
+        elif is_shell:
+            if hg.shell_write_match({"globs": p_globs, "except": []}, cmds, redir_targets, cwd, home_rp, command):
+                protect_why = "work orders, DIRECTOR_LOG.md, and director governance files are protected from shell writes (docs/02); report BLOCKED instead"
+            elif data is not None:
+                protect_why = hg.protected_delete(data, cmds, cwd, p_globs)
 
+    why = hg.reason(command, shell) if isinstance(command, str) else None
     label = "builtin"
-    if not why and sessions is not None and isinstance(command, str) and eval_call.get("tool_name") in hg.SHELL_TOOLS:
-        shell = "powershell" if eval_call.get("tool_name") == "PowerShell" else "bash"
-        why = hg.protected_delete(data, list(hg.simple_commands(hg.FD_DUP.sub(" ", command), shell)), cwd, sessions.get("protected", []))
+    if not why and sessions is not None and is_shell:
+        why = hg.protected_delete(data, cmds, cwd, sessions.get("protected", []))
         label = "protected" if why else label
 
     hits = hg.decide(data, profile, eval_call, a.rules) if data is not None else []
-    hits += agy_extra_hits(hg, data, profile, eval_call, raw_name, a.rules)
+    hits += agy_extra_hits(hg, data, profile, eval_call, raw_name, a.rules, raw_args=raw_args)
 
     deny = hg.first(hits, "deny")
     ask = hg.first(hits, "ask")
@@ -315,16 +422,16 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
         hard = hg.first([h for h in hits if h[0] == "deny" and (kinds.get(h[1]) in hg.HARD_DENY or h[1] in ("G00", "G53"))], "deny")
         if hard:
             msg = f"BLOCKED by agy_guard [{hard[1]}]: {hard[2]} (hard-denied in every mode)"
-            hg.audit(a.audit, canonical, "deny", hard[1])
+            hg.audit(audit_target, canonical, "deny", hard[1])
             if fmt == "antigravity":
                 return emit_antigravity("deny", msg)
             print(msg, file=sys.stderr)
             return 2
 
-    if sess_why or (a.protect and hg.base_profile(profile) != "director" and why and eval_call.get("tool_name") in ("Write", "Edit")):
-        # Protecting DIRECTOR/orders, DIRECTOR_LOG.md, and .sessions.json from non-director writes is always hard-denied
-        msg = f"BLOCKED by agy_guard [protect]: {sess_why or why}"
-        hg.audit(a.audit, canonical, "deny", "protect")
+    if sess_why or protect_why:
+        # Protecting DIRECTOR/orders, DIRECTOR_LOG.md, governance configs, tools, and .sessions.json is always hard-denied
+        msg = f"BLOCKED by agy_guard [protect]: {sess_why or protect_why}"
+        hg.audit(audit_target, canonical, "deny", "protect")
         if fmt == "antigravity":
             return emit_antigravity("deny", msg)
         print(msg, file=sys.stderr)
@@ -335,7 +442,7 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
     if a.mode != "block" and (deny or why or ask):
         rule, text = (deny[1], deny[2]) if deny else (label, why) if why else (ask[1], ask[2])
         if a.mode == "ask":
-            hg.audit(a.audit, canonical, "ask", rule)
+            hg.audit(audit_target, canonical, "ask", rule)
             if fmt == "antigravity":
                 return emit_antigravity("force_ask", f"[{rule}] {text}", overwrite)
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
@@ -343,8 +450,8 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
             return 0
         # remind mode (seat belt)
         line = f"hook_guard reminder [{rule}]: {text}"
-        hg.audit(a.audit, canonical, "remind", rule)
-        queue_bridge_alert(a.bridge_state, conv_id, line + hg.REMIND_NOTE)
+        hg.audit(audit_target, canonical, "remind", rule)
+        queue_bridge_alert(bridge_target, conv_id, line + hg.REMIND_NOTE)
         if fmt == "antigravity":
             return emit_antigravity("allow", line, overwrite)
         print(json.dumps({"systemMessage": line, "hookSpecificOutput": {
@@ -354,40 +461,40 @@ def evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, con
     if deny or why:
         rule = deny[1] if deny else label
         msg = f"BLOCKED by agy_guard [{deny[1]}]: {deny[2]}" if deny else f"BLOCKED by agy_guard: {why}"
-        hg.audit(a.audit, canonical, "deny", rule)
-        conf = ((data.get("auto_pause") or {}).get(hg.base_profile(profile)) if a.pause_flag and data is not None and not paused
+        hg.audit(audit_target, canonical, "deny", rule)
+        conf = ((data.get("auto_pause") or {}).get(hg.base_profile(profile)) if pause_target and data is not None and not paused
                 and not (sessions is not None and profile == "director") else None)
-        paused_now = hg.auto_pause(a.pause_flag, conf, rule) if conf else None
+        paused_now = hg.auto_pause(pause_target, conf, rule) if conf else None
         if paused_now:
             msg += f"; AUTO-PAUSED: {paused_now}"
-            hg.audit(a.audit, canonical, "pause", "AUTO")
+            hg.audit(audit_target, canonical, "pause", "AUTO")
         if fmt == "antigravity":
             return emit_antigravity("deny", msg)
         print(msg, file=sys.stderr)
         return 2
 
     if ask:
-        hg.audit(a.audit, canonical, "ask", ask[1])
+        hg.audit(audit_target, canonical, "ask", ask[1])
         if fmt == "antigravity":
             return emit_antigravity("force_ask", f"[{ask[1]}] {ask[2]}", overwrite)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                                                  "permissionDecisionReason": f"[{ask[1]}] {ask[2]}"}}))
         return 0
 
-    if a.loop_guard and a.audit:
+    if a.loop_guard and audit_target:
         loop_mod = load_sibling("loop_guard")
         loop_conf = loop_mod.load_config(a.loop_config)
-        found = loop_mod.hook_reminder(canonical, a.audit, loop_conf)
+        found = loop_mod.hook_reminder(canonical, audit_target, loop_conf)
         if found:
             rule, text = f"LOOP:{found[0]}", found[1]
-            hg.audit(a.audit, canonical, a.loop_mode, rule)
+            hg.audit(audit_target, canonical, a.loop_mode, rule)
             if a.loop_mode == "ask":
                 if fmt == "antigravity":
                     return emit_antigravity("force_ask", text, overwrite)
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                                                          "permissionDecisionReason": text}}))
                 return 0
-            queue_bridge_alert(a.bridge_state, conv_id, text)
+            queue_bridge_alert(bridge_target, conv_id, text)
             if fmt == "antigravity":
                 return emit_antigravity("allow", text, overwrite)
             print(json.dumps({"systemMessage": text, "hookSpecificOutput": {
@@ -417,6 +524,7 @@ def main(argv=None):
     ap.add_argument("--loop-config", help="loop_guard JSON config")
     ap.add_argument("--loop-mode", choices=("remind", "ask"), default="remind", help="loop finding mode (default: remind)")
     ap.add_argument("--overwrite-utf8", action="store_true", help="opt-in: inject -I -X utf8 on bare python script commands via PreToolUse overwrite")
+    ap.add_argument("--dry-run-probe", action="store_true", help="read-only health probe mode: skip writing audit, bridge-state, or pause flags")
     a = ap.parse_args(argv)
 
     hg = load_sibling("hook_guard")
@@ -442,13 +550,18 @@ def main(argv=None):
     if fmt == "antigravity":
         canonical, raw_name, raw_args = translate_antigravity_call(payload, a.shell)
         conv_id = canonical.get("session_id")
+        tool_cwd = first_str(raw_args, "Cwd", "cwd", "workspace") if isinstance(raw_args, dict) else None
     else:
         canonical = dict(payload)
         raw_name = canonical.get("tool_name") if isinstance(canonical.get("tool_name"), str) else ""
         raw_args = canonical.get("tool_input") if isinstance(canonical.get("tool_input"), dict) else {}
         conv_id = canonical.get("session_id")
+        tool_cwd = canonical.get("cwd") if isinstance(canonical.get("cwd"), str) else None
 
-    return evaluate_call(hg, data, sessions, a, canonical, raw_name, raw_args, fmt, conv_id, agent_hint=agent_hint)
+    return evaluate_call(
+        hg, data, sessions, a, canonical, raw_name, raw_args, fmt, conv_id,
+        agent_hint=agent_hint, raw_payload=payload, tool_cwd=tool_cwd,
+    )
 
 
 if __name__ == "__main__":
