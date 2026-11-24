@@ -2004,9 +2004,12 @@ E2E_EXIT = re.compile(
     r"^[ \t]*EXIT_CODE[ \t]*[:=][ \t]*(-?\d+)\b|\bexit[ \t]*=[ \t]*(-?\d+)\b|\bCommand exited with code[ \t]+(-?\d+)\b",
     re.I | re.M,
 )
-E2E_FAIL_MARKER = re.compile(r"^[ \t]*(?:FAILED\b|FAIL\b|ERROR:|Traceback \(most recent call last\):)", re.M)
+E2E_FAIL_MARKER = re.compile(
+    r"(?:^[ \t]*(?:FAILED\b|FAIL\b|ERROR:|Traceback \(most recent call last\):|(?:RESULT|STATUS|VERDICT)[ \t]*[:=][ \t]*(?:FAIL|FAILED|ERROR|BLOCKED|PARTIAL)\b)|\b[1-9]\d*[ \t]+failed\b)",
+    re.I | re.M,
+)
 E2E_PASS_MARKER = re.compile(r"^[ \t]*(?:RESULT|STATUS|VERDICT)[ \t]*[:=][ \t]*(?:PASS|OK|SUCCESS)\b", re.I | re.M)
-E2E_CANDIDATE_FIELD = re.compile(r"^[ \t]*(?:CANDIDATE_HEAD|CANDIDATE|COMMIT|HEAD)[ \t]*:[ \t]*([0-9a-fA-F]{7,40})\b", re.M)
+E2E_CANDIDATE_FIELD = re.compile(r"^[ \t]*(?:CANDIDATE_HEAD|CANDIDATE|COMMIT|HEAD)[ \t]*[:=][ \t]*`?([0-9a-fA-F]{7,40})`?\b", re.M)
 
 
 FEAS_FIELD = re.compile(r"^[ \t]*(FEASIBILITY|FEASIBLE_COUNT|SCRIPT|RESULT)[ \t]*[:=][ \t]*(.*?)[ \t]*$", re.M)
@@ -2123,6 +2126,7 @@ def final_problems(folder, notes, allow_incomplete_e2e=False, candidate=None):
             if not any(E2E_ENTRY.search(txt) for _, txt in texts):
                 notes.append(f"WARN E2E: no active record in {e2e} names its `ENTRY_POINT:` (the one public entry point it ran)")
             completed_texts = []
+            incomplete_names = []
             e2e_failed = False
             for p, txt in texts:
                 file_failed = False
@@ -2145,12 +2149,16 @@ def final_problems(folder, notes, allow_incomplete_e2e=False, candidate=None):
                     file_failed = True
                 if not file_failed and (file_zero_exit or E2E_PASS_MARKER.search(txt)):
                     completed_texts.append((p, txt))
+                elif not file_failed:
+                    incomplete_names.append(p.name)
             if not e2e_failed and not completed_texts:
                 msg = f"E2E_INCOMPLETE: no record in {e2e} contains an explicit completed outcome (e.g. `EXIT_CODE: 0` or `RESULT: PASS`)"
                 if allow_incomplete_e2e:
                     notes.append(f"WARN {msg}")
                 else:
                     problems.append(msg)
+            elif incomplete_names:
+                notes.append(f"WARN E2E_INCOMPLETE: additional record(s) without explicit completed outcome: {', '.join(incomplete_names)}")
             if candidate and completed_texts:
                 if not any(_e2e_matches_candidate(txt, candidate) is True for _, txt in completed_texts):
                     problems.append(f"E2E: no completed record in {e2e} has structured COMMIT:/CANDIDATE_HEAD: matching candidate commit {candidate[:12]}")

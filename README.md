@@ -17,14 +17,14 @@
 ```text
 python -B -I -X utf8 D:/path/to/agy-DIRECTOR-WORKER/tools/agy_setup.py --repo D:/path/to/your-project --init-director --apply
 ```
-> Linux／macOS 若無 `python` 別名，改以 `python3 -B -I -X utf8 ...` 執行（Hook 指令已內建 `python ... || python3 ...` 自動 fallback）。
+> Linux／macOS 若無 `python` 別名，改以 `python3 -B -I -X utf8 ...` 執行（外掛 `plugin/director-work/hooks.json` 內建 `python ... || python3 ...` 自動 fallback；工作區 `.agents/hooks.json` 則優先寫入當下執行 `agy_setup.py` 的直譯器路徑 `sys.executable`）。
 
 這支腳本會先通過原子預檢（包含路徑節點型別與 Git 歸屬驗證）再一次做好三件事（全程不碰 `~/.gemini/config/config.json`）：
-1. 在 Git common dir 的 `info/exclude`（含 linked worktree）排除本機產物（`AGENTS.local.md`、`.agents/hooks.local.json`、`_work/`）。
-2. 在 `<REPO>/.agents/plugins.json` 合併或原地升級 `director-work` 路徑，並在 `<REPO>/.agents/hooks.json` 合併寫入含 `--protect` 與 `--sessions` 角色綁定的 `agydw-guard` 與 `agydw-audit-and-bridge`。
-3. 在專案外建立獨立的 `<WS>/DIRECTOR-<repo>/` 狀態資料夾（含非 ASCII 倉庫名路徑雜湊防撞與 Git common-dir 歸屬綁定；升級採 Side-by-Side `tools_v<VER>_<HASH8>` 零中斷切換並保留 `.tools_backup_*` 回滾備份）；填妥 `RESUME_STATE.md` 並用 `--register-director <CID>` 登記總監會話（保留既有護欄選項並具 `.sessions.json.lock` 並行鎖保護）後，跑一次 `agy_doctor.py` 與 `agy_setup_check.py --strict --repo <REPO>` 驗證。
+1. 在 Git common dir 的 `info/exclude`（含 linked worktree）預設排除本機產物（`AGENTS.local.md`、`.agents/hooks.local.json`、`.agents/hooks.json`、`.agents/plugins.json`、`_work/`；若專案刻意將 `.agents/hooks.json` 納入版控，可改傳 `--no-exclude-agents`）。
+2. 在 `<REPO>/.agents/plugins.json` 合併或原地升級 `director-work` 路徑（若既有 bundle 使用 `"exclude": ["director-work"]` 可明確排除管理），並在 `<REPO>/.agents/hooks.json` 合併寫入含 `--protect` 與 `--sessions` 角色綁定的 `agydw-guard` 與 `agydw-audit-and-bridge`（支援 `--enable` 重新啟用曾被手動停用的群組）。
+3. 在專案外建立獨立的 `<WS>/DIRECTOR-<repo>/` 狀態資料夾（含非 ASCII 倉庫名路徑雜湊防撞與 Git common-dir 歸屬綁定；升級採 Side-by-Side `tools_v<VER>_<HASH8>` 零中斷切換，依 `--keep-versions 2` 自動清理更舊版本並保留 `.tools_backup_*` 回滾備份）；填妥 `RESUME_STATE.md` 並用 `--register-director <CID>` 登記總監會話（保留既有護欄選項並具 `.sessions.json.lock` 並行鎖保護）後，跑一次 `agy_doctor.py` 與 `agy_setup_check.py <DIRECTOR> --repo <REPO> --strict` 驗證。
 
-掛載後，在 Antigravity 開新對話直接點選外掛建議指令或輸入：
+掛載後，在 Antigravity 開新對話直接點選外掛建議指令或輸入（若只用方法一外掛已自動載入規則；方法二才需貼整段啟動提示詞）：
 - `請啟動總監制 bootstrap：幫這個專案選擇一般模式或小白模式並建立 DIRECTOR/ 狀態`
 
 ---
@@ -162,14 +162,14 @@ flowchart LR
 ```text
 # 1. 一鍵替專案安裝／升級 agydw（原子預檢＋專案鎖保護讀改寫＋保留既有停用 Hook；Linux 無 python 別名請改用 python3）
 python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --init-director --apply
-# （第 2 步：註冊總監對話 ID 到 .sessions.json；支援 --no-enforce-resume／--no-overwrite-utf8／--copy-tools 明確關閉既定開關）
+# （第 2 步：註冊總監對話 ID 到 .sessions.json；支援 --enable／--no-enforce-resume／--no-overwrite-utf8／--no-exclude-agents／--copy-tools）
 python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --register-director <CONVERSATION_ID> --apply
 
 # 2. 環境與外掛健康檢查（完全只讀：Shell Probe 自動隔離暫存 audit／bridge／pause 不寫入工作區）
 python -B -I -X utf8 <RULES>/tools/agy_doctor.py --repo <REPO> --plugin <RULES>/plugin/director-work --probe-hooks
 
 # 3. 檢查 DIRECTOR/ 與工作區 .agents/ 設定一致性與專案歸屬
-python -B -I -X utf8 <RULES>/tools/agy_setup_check.py --strict <DIRECTOR> --repo <REPO>
+python -B -I -X utf8 <RULES>/tools/agy_setup_check.py <DIRECTOR> --repo <REPO> --strict
 
 # 4. 鎖定測試檔案與核准 PLAN.md
 python -B -I -X utf8 <RULES>/tools/safety_gate.py --lock-tests tests/test_calc.py --repo <REPO>
@@ -203,7 +203,7 @@ python -B -I -X utf8 <RULES>/tools/selftest_agy.py --verbose
 | [`docs/11_antigravity_operations.md`](docs/11_antigravity_operations.md) | Antigravity 工具對照、Swarm / Workflow / Browser 與 Windows AppContainer 操作實務 | 設定工作區與開線前必讀 |
 | [`plugin/director-work/`](plugin/director-work/plugin.json) | 可直接掛載的 Antigravity Plugin（Rules / Hooks / 5 Skills / 3 Subagents） | 用方法一或寫作子代理時 |
 | [`templates/`](templates/WORK_ORDER.md) | 工單、報告、裁決、初衷卡、Hook 範本、Workflow Fan-Out 腳本、`weird_inputs.py` | 建置與派工時複製使用 |
-| [`tools/`](tools/AGY-TOOLS.md) | 27 份上游核心工具（原樣：25 `.py`＋2 `.json`）＋ 7 支調整版 `.py` ＋ 7 支 `agy_*.py` 新工具 ＋ `selftest_agy.py` | 查 [`tools/AGY-TOOLS.md`](tools/AGY-TOOLS.md) 與 [`tools/README.md`](tools/README.md) |
+| [`tools/`](tools/AGY-TOOLS.md) | 27 份上游核心工具（原樣：25 `.py`＋2 `.json`）＋ 7 支調整版 `.py` ＋ 8 支 `agy_*.py` 新工具（含 `agy_common.py`）＋ `selftest_agy.py` | 查 [`tools/AGY-TOOLS.md`](tools/AGY-TOOLS.md) 與 [`tools/README.md`](tools/README.md) |
 
 ---
 
@@ -215,7 +215,7 @@ python -B -I -X utf8 <RULES>/tools/selftest_agy.py --verbose
 4. **Windows `cmd /c` 執行 Hook 的引號限制**：Windows 上 Antigravity 以 `cmd /c <command>` 呼叫 Hook；`agy_setup.py` 與 `plugin/director-work/hooks.json` 已避開開頭與結尾皆帶 `"` 的語法，若自行改寫 Hook 請通過 `agy_doctor.py --probe-hooks` 驗證。
 5. **模型 Effort 與 Token 估算**：Antigravity App 介面可調整思考層級（`low` 到 `max`），但單一對話歷史的 `transcript.jsonl` 並未對每一步個別印出 UI 切換後的 effort 標籤；`agy_usage.py` 以實測驗證的 `input_tokens + cache_read_tokens` 計算上下文總量。
 6. **絕不自動修改全域設定**：任何工具與文件都不會幫你改動 `~/.gemini/config/config.json`，全域套件啟用仍由你親自在 Antigravity Plugins UI 操作。
-7. **Linux／macOS 無 `python` 別名環境**：若系統僅提供 `python3` 而無 `python`，手動執行 CLI 工具時請以 `python3 -B -I -X utf8 ...` 呼叫；`agy_setup.py` 與外掛 `hooks.json` 產生的 Hook 指令均已內建 `python ... || python3 ...` 自動 fallback。
+7. **Linux／macOS 無 `python` 別名環境**：若系統僅提供 `python3` 而無 `python`，手動執行 CLI 工具時請以 `python3 -B -I -X utf8 ...` 呼叫；外掛 `plugin/director-work/hooks.json` 內建 `python ... || python3 ...` 自動 fallback，工作區 `.agents/hooks.json` 則優先寫入當下直譯器 `sys.executable`。
 8. **安裝預檢與中途中斷邊界**：`agy_setup.py --apply` 會先以 `validate_target_path_types()` 與專案歸屬預檢擋下型別衝突（如既定目錄位置其實是一般檔案）、壞掉的 JSON 或他案歸屬（零寫入失敗）。若通過預檢後仍遇 OS 層磁碟／權限錯誤，單檔以暫存檔原子替換、工具升級採 Side-by-Side `tools_v*` 與 `.tools_backup_*` 減少破損，但仍需依誠實報錯排除環境原因後重跑 `--apply`。
 
 ---

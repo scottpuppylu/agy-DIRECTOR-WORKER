@@ -24,7 +24,23 @@ import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-CORE_PRETOOL_TOOLS = ("run_command", "read_file", "write_file", "edit_file")
+
+
+def _load_common():
+    p = HERE / "agy_common.py"
+    spec = importlib.util.spec_from_file_location("_agy_chk_common", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_COMMON = _load_common()
+
+CORE_PRETOOL_TOOLS = (
+    "run_command", "read_file", "view_file", "write_file", "write_to_file",
+    "edit_file", "replace_file_content", "grep_search", "find_by_name",
+    "call_mcp_tool", "mcp_files_trash_file",
+)
 REQUIRED_FILES = (
     "DIRECTOR_STATE.md",
     "ACTIVE_WORKSTREAMS.md",
@@ -40,33 +56,16 @@ PLACEHOLDER = re.compile(r"^<[^<>]*>$|^TBD$|^待\S*$")
 
 
 def load_sibling(name):
-    """Load sibling module cleanly."""
-    spec = importlib.util.spec_from_file_location(f"_agy_chk_{name}", HERE / f"{name}.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    """Load and cache sibling module cleanly."""
+    return _COMMON.load_sibling(HERE, name, prefix="_agy_chk_")
 
 
 def _norm_key(p):
-    try:
-        return os.path.normcase(pathlib.Path(p).resolve().as_posix())
-    except (OSError, ValueError):
-        return os.path.normcase(str(p).replace("\\", "/"))
+    return _COMMON.norm_path_key(p)
 
 
 def _git_common_dir(repo):
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            p = pathlib.Path(proc.stdout.strip())
-            return p.resolve() if p.is_absolute() else (pathlib.Path(repo) / p).resolve()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    dot = pathlib.Path(repo) / ".git"
-    return dot.resolve() if dot.exists() else None
+    return _COMMON.git_common_dir(repo)
 
 
 def _matcher_covers_core(matcher):
@@ -153,8 +152,10 @@ def validate_hooks_structure(hdata):
             problems.append(".agents/hooks.json 'agydw-audit-and-bridge' missing PostToolUse list")
         else:
             b_cmds, bm_errs = _extract_hook_entries(post, need_matcher=True)
-            if not (any("agy_audit.py" in c for c in b_cmds) and any("agy_hook_bridge.py" in c for c in b_cmds)):
-                msg = ".agents/hooks.json 'agydw-audit-and-bridge' PostToolUse missing active agy_audit.py / agy_hook_bridge.py"
+            has_unified_post = any("agy_hook_bridge.py" in c and "--audit-log" in c for c in b_cmds)
+            has_split_post = any("agy_audit.py" in c for c in b_cmds) and any("agy_hook_bridge.py" in c for c in b_cmds)
+            if not (has_unified_post or has_split_post):
+                msg = ".agents/hooks.json 'agydw-audit-and-bridge' PostToolUse missing active unified or split agy_audit / agy_hook_bridge handler"
                 if bm_errs:
                     msg += f" ({'; '.join(bm_errs)})"
                 problems.append(msg)
@@ -355,6 +356,12 @@ def check_director(dpath, repo_path=None):
                             problems.append(f".agents/hooks.json guard mode drifted from {setup_state_fp.name} (expected --mode {want_mode})")
                         if sstate.get("audit_log"):
                             got_audit = _extract_opt(_split_cmd_tokens(pre_cmd), "--audit")
+                            if not got_audit:
+                                post_cmds, _ = _extract_hook_entries((hdata.get("agydw-audit-and-bridge") or {}).get("PostToolUse"), need_matcher=True)
+                                for pc in post_cmds:
+                                    got_audit = _extract_opt(_split_cmd_tokens(pc), "--audit-log") or _extract_opt(_split_cmd_tokens(pc), "--log")
+                                    if got_audit:
+                                        break
                             if not got_audit or _norm_audit_path_key(got_audit) != _norm_audit_path_key(sstate["audit_log"]):
                                 problems.append(f".agents/hooks.json audit log drifted from {setup_state_fp.name} ({sstate['audit_log']})")
                         if sstate.get("enforce_resume"):

@@ -3,6 +3,24 @@
 本 repo 是 [DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK) `v2.6.0`（commit `787f67b`）在 Google Antigravity（App 2.0 / `agy` CLI / IDE / Python SDK）的原生移植版（簡稱 `agydw`），並承襲同作者 `dsh-DIRECTOR-WORKER`（`v2.6.0-ds.6`）的雙軌上游同步架構與安全閘門。
 上游完整變更歷史保留在 [`CHANGELOG-upstream.md`](CHANGELOG-upstream.md)；本檔只記 `agy-DIRECTOR-WORKER` 自己的版本與「對齊初衷」。
 
+## 2.6.0-agy.6（2026-11-24）
+
+### 架構統一、效能最佳化與安全強化（整合多路審查發現）
+- **新增 `tools/agy_common.py` 共用標準函式庫核心**：收斂路徑正規化、純檔案系統 `.git` / linked worktree 追蹤、`write_text_atomic` / `write_json_atomic`、Transcript 單遍尾掃描與 Token 統計輔助函式，大幅降低跨模組重複程式碼。
+- **P0/P1 安全帶與守衛全面 Fail-Closed 與繞過修補（`plugin/director-work/scripts/seatbelt_hook.py`、`hooks.json`、`tools/agy_guard.py`）**：
+  - `agy_guard.py` 對空輸入、損壞或非物件 JSON 全面改採 `deny` Fail-Closed；擴充 `PreToolUse` `matcher` 與內部轉譯涵蓋 `call_mcp_tool`、`mcp_*`（轉為 `mcp__<srv>__<act>` 使 `G11`/`G21`/`G30`/`G42` 實際生效）、`run_workflow` 與 `manage_task`。
+  - 修補 Windows 尾隨空白／句點（`".env "`）與 NTFS 資料流（`::$DATA`）繞過、PowerShell 冒號參數（`-Path:`/`-LiteralPath:`）與無 `-Command` 字串引數、`dd of=`、`git show <rev>:.env`、以及 `find_by_name` `Includes` 陣列首元素以外與 `.env*` 漏檢。
+  - `--protect` 擴充保護 `PO_PENDING.md`、`reviews/**`、`BRIEF.md`、`DECISION_REGISTER.md`、`DIRECTOR_STATE.md`、`evidence/**`、`audit/**`、`PAUSE.flag` 等關鍵治理檔案，且非總監對 `G43`（`.agents/hooks*.json`、`AGENTS.md` 等設定檔）一律強制 `deny`。
+  - 新增 `glob_regex` 快取與逐次路徑快取，消除長命令 `O(N)` 重複 `GetLongPathNameW` 系統呼叫與正則重編譯；`--overwrite-utf8` 改為補 `-X utf8`（不再強制插入 `-I`，避免破壞套件模組工作目錄匯入）並支援含空白引號腳本路徑。
+  - `seatbelt_hook.py` 支援同程序直接載入 `agy_guard.run_from_raw(..., emit=False)`（取代每次多開第二支 Python 子程序）與工作區受信任邊界校驗。
+- **單次統一 `PostToolUse`、子代理用量與跨平台修正（`agy_hook_bridge.py`、`agy_audit.py`、`agy_usage.py`）**：
+  - `agy_hook_bridge.py post-tool --audit-log` 單一程序同時完成 SHA-256 動作稽核鏈寫入（透過 `agy_audit.append_payload_entry`）、提示注入掃描與輪詢偵測，減半 `PostToolUse` 冷啟動延遲；`stop-check --sessions` 正確區分已乾淨提交的 linked worktree worker 與未寫入總監 `RESUME_STATE.md` 的分支。
+  - `agy_audit.py` 補齊 `Output:`/`Command output:`、`Exit code: N`、`step_index` 精確正則、`subagent` UUID 大小寫與 `batch_pending` 孤兒錯誤保留；重寫 `discover_transcripts()` 拓撲發現與 `--audit` 壞行容錯。
+  - `agy_usage.py` 改為單遍串流 `summarize_conversation_streaming()`（大幅降低大檔記憶體與延遲）、修正 `discover_transcripts` 父層預先佔位導致 `--project-dir --include-subagents` 漏計子代理、移除路徑前綴誤歸屬，並修正 `--since`/`--until` 搭配子代理的誤報 `NO_DATA`。
+- **閘門、Workflow、設定管理與文件一致性（`gate_check.py`、`scope_check.py`、`safety_gate.py`、`release.py`、`agy_setup.py`、`agy_setup_check.py`、`agy_doctor.py`、`gate_verify_workflow.py`）**：
+  - 修正 `gate_check.py --final` 對 `RESULT: FAIL` + `EXIT_CODE: 0` 假通過並加上 `WARN E2E_INCOMPLETE`、`scope_check.py` 孤兒 `HEAD`、`safety_gate.py` 含空白測試檔名、`release.py` POSIX `/home/`／`/Users/` 與 `DIRECTOR-*` 遮罩、以及 Windows `gate_verify_workflow.py` 避開 `WindowsApps\python3.EXE` 存根並使用 `& ` 呼叫運算子。
+  - `agy_setup.py` 支援 `director_work.json["agydw"]` 雙向對齊、`--enable` 重新啟用停用群組、保留既有自訂 Hook/Plugin 欄位、預設排除 `.agents/hooks.json`／`.agents/plugins.json`（可 `--no-exclude-agents` 關閉）、`--keep-versions 2` 清理舊版 `tools_v*`、`--copy-tools` 重啟、正確縮排遷移 `RULES_PATH:` 與 `~`/相對路徑展開。
+
 ## 2.6.0-agy.5（2026-11-24）
 
 ### P0 安全修補：外掛安全帶隔離與 Fail-Closed

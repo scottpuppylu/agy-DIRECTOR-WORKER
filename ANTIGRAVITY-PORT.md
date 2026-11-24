@@ -1,6 +1,6 @@
 # ANTIGRAVITY-PORT — `DIRECTOR-WORK v2.6.0` 到 Antigravity 的設計對照與實證紀錄
 
-本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.5`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的平台能力轉化為實質治理優勢。
+本文件記錄 **agy-DIRECTOR-WORKER（`agydw` `2.6.0-agy.6`）** 如何從 [scottpuppylu/DIRECTOR-WORK](https://github.com/scottpuppylu/DIRECTOR-WORK)（`v2.6.0`）移植到 **Google Antigravity**，同時參考 [scottpuppylu/dsh-DIRECTOR-WORKER](https://github.com/scottpuppylu/dsh-DIRECTOR-WORKER) 的架構經驗：保留乾淨的上游可同步核心，並將 Antigravity 的平台能力轉化為實質治理優勢。
 
 ---
 
@@ -139,11 +139,11 @@
 | `agy_setup_check.py --strict` | `OK`（`PENDING_METHOD`、`PO_PENDING`、`RESUME_STATE`、`.agents/` 均過關） |
 | `agy_doctor.py --probe-hooks` | （`v2.6.0-agy.1` 歷史實測快照：`ENFORCED=2`；`v2.6.0-agy.2+` 已改採誠實狀態與無寫入探測，`WARN=0, FAIL=0`） |
 | `agy_usage` 統計快照 | 兩對話合計 `2 sessions`、`26 turns`、`39 tool_calls`、`total_tokens=1,036,189`（下文第 4 項） |
-| `selftest_agy.py --verbose` | `v2.6.0-agy.1` 初版時為 `8/8 PASS`；自 `v2.6.0-agy.5` 起擴增為 **31/31 PASS** |
+| `selftest_agy.py --verbose` | `v2.6.0-agy.1` 初版時為 `8/8 PASS`；`v2.6.0-agy.5` 為 `31/31`；自 `v2.6.0-agy.6` 起擴增為 **37/37 PASS** |
 
 4. **真實 `agy_usage.py` Token 與上下文實測**：
    - **Worker（`4b193101`）**：`23 turns`、`59 steps`、`33 tool_calls`、`input_tokens=136,214`、`cache_read_tokens=796,214`、`output_tokens=21,423`、`total_tokens=953,851`、`last_prompt_tokens=57,833`、`peak_prompt_tokens=57,833`（快取命中率 `85.4%`）。
    - **唯讀盲審員（`902309a8`）**：`3 turns`、`11 steps`、`6 tool_calls`、`input_tokens=50,387`、`cache_read_tokens=23,934`、`output_tokens=8,017`、`total_tokens=82,338`、`last_prompt_tokens=31,119`（快取命中率 `32.2%`）。
    - **合計**：`2 sessions`、`26 turns`、`39 tool_calls`、`total_tokens=1,036,189`。
 5. **自檢整合回歸（`tools/selftest_agy.py --verbose`）**：
-   - `v2.6.0-agy.1` 初版驗證為 8/8 PASS；目前已擴充至 **31/31 PASS（`pass=31 skip=0 fail=0`, `exit 0`）**：涵蓋 `39/39` 上游 `v2.6.0` SHA-256 逐位元一致比對、`40` 支工具 `--help`、fail-closed 外掛隔離與防 RCE、Windows `cmd /c` 含空白路徑掛勾執行、兩段式 `PostToolUse -> PreInvocation` 橋接、worktree 稽核鏈隔離、並行結構 setup 鎖與無洩漏檢查。
+   - `v2.6.0-agy.1` 初版驗證為 8/8 PASS；目前已擴充至 **37/37 PASS（`pass=37 skip=0 fail=0`, `exit 0`）**：涵蓋 `39/39` 上游 `v2.6.0` SHA-256 逐位元一致比對、`41` 支工具 `--help`、Fail-Closed 外掛隔離與防 RCE、MCP 與 Windows 繞過防禦、單次統一 `PostToolUse`（`post-tool --audit-log`）與兩段式 `PreInvocation` 橋接、worktree 稽核與 role-aware Stop、單遍串流 `agy_usage.py` 子代理統計、並行結構 setup 鎖與無洩漏檢查。

@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""Workspace bootstrap & upgrade helper for agy-DIRECTOR-WORKER (agydw). Dry-run by default; --apply writes.
+"""Workspace bootstrap & upgrade helper for agy-DIRECTOR-WORKER (agydw 2.6.0-agy.6). Dry-run by default; --apply writes.
 
 Idempotently wires a project repository for Antigravity Director/Worker governance WITHOUT
 modifying user-global ~/.gemini/config/config.json:
   1. Pre-flight validates repo, rules root, project ownership, all target path types (files vs
      directories), existing .agents/*.json syntax, and .sessions.json BEFORE writing any byte.
-  2. Persists chosen guard options in <DIRECTOR>/.agydw_setup_state.json so maintenance commands
-     (like `--register-director <CID>`) preserve --guard-mode, --enforce-resume, and custom paths.
-  3. Uses a cross-process file lock for .sessions.json and apply commits so concurrent registration
-     calls never overwrite each other's entries.
-  4. Installs tools into side-by-side versioned directories (<DIRECTOR>/tools_v<VER>_<HASH8>/) and
-     switches .agents/hooks.json atomically before updating compatibility <DIRECTOR>/tools/.
-  5. Migrates legacy v2.6.0-agy.1/.2 director_work.json to include `project_git_common_dir` while
-     preserving all custom/unknown fields, and disambiguates non-ASCII project folder names.
-
-Usage:
-  python -B -I -X utf8 agy_setup.py --repo <REPO> [--director <DIR>] [--init-director] [--apply]
+  2. Persists chosen guard options in <DIRECTOR>/.agydw_setup_state.json and syncs
+     <DIRECTOR>/director_work.json["agydw"], preserving extra custom keys across upgrades.
+  3. Uses a cross-process file lock for .sessions.json and full --apply commits, with clear
+     recovery diagnostics on lock timeouts.
+  4. Installs tools into side-by-side versioned directories (<DIRECTOR>/tools_v<VER>_<HASH8>/)
+     recursively verified by SHA-256, switches .agents/hooks.json (single unified PostToolUse +
+     MCP/Pause/Stop role wiring) atomically, and prunes stale versioned/backup copies.
+  5. Excludes machine-bound .agents/hooks.json & .agents/plugins.json via Git common info/exclude
+     by default (--no-exclude-agents opts out).
 """
 import argparse
 import contextlib
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -28,12 +27,25 @@ import random
 import re
 import shlex
 import shutil
-import subprocess
 import sys
 import time
 
 HERE = pathlib.Path(__file__).resolve().parent
-LOCAL_EXCLUDES = ("AGENTS.local.md", ".agents/hooks.local.json", "_work/")
+
+
+def _load_common():
+    p = HERE / "agy_common.py"
+    spec = importlib.util.spec_from_file_location("_agy_setup_common", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_COMMON = _load_common()
+
+BASE_LOCAL_EXCLUDES = ("AGENTS.local.md", ".agents/hooks.local.json", "_work/")
+AGENTS_LOCAL_EXCLUDES = (".agents/hooks.json", ".agents/plugins.json")
+LOCAL_EXCLUDES = BASE_LOCAL_EXCLUDES + AGENTS_LOCAL_EXCLUDES
 MANIFEST_NAME = "AGYDW_TOOLS_MANIFEST.json"
 SETUP_STATE_NAME = ".agydw_setup_state.json"
 
@@ -45,14 +57,11 @@ def read_version(rules_root):
         txt = vf.read_text(encoding="utf-8-sig", errors="replace").strip()
         if txt:
             return txt
-    return "2.6.0-agy.5"
+    return "2.6.0-agy.6"
 
 
 def _norm_path_key(path_str):
-    try:
-        return os.path.normcase(pathlib.Path(path_str).resolve().as_posix())
-    except (OSError, ValueError):
-        return os.path.normcase(str(path_str).replace("\\", "/"))
+    return _COMMON.norm_path_key(path_str)
 
 
 @contextlib.contextmanager
@@ -78,7 +87,11 @@ def file_lock(lock_path, wait_s=15.0, stale_s=30.0):
             except OSError:
                 pass
             if time.monotonic() >= end:
-                raise RuntimeError(f"timed out waiting for lock {lp.as_posix()} after {wait_s:g}s")
+                raise RuntimeError(
+                    f"timed out waiting for lock {lp.as_posix()} after {wait_s:g}s; "
+                    f"verify no other agy_setup process is running (locks older than {stale_s:g}s auto-clear), "
+                    "wait for expiry or remove the stale lock if crashed, then re-run and verify with agy_setup_check.py --strict"
+                )
             time.sleep(0.015 + random.random() * 0.025)
     try:
         yield
@@ -91,44 +104,16 @@ def file_lock(lock_path, wait_s=15.0, stale_s=30.0):
 
 
 def git_dir(repo):
-    """Resolve <repo>/.git directory (handles linked git worktrees)."""
-    dot = pathlib.Path(repo) / ".git"
-    if dot.is_dir():
-        return dot.resolve()
-    if dot.is_file():
-        m = re.match(r"gitdir:\s*(.+)", dot.read_text(encoding="utf-8", errors="replace").strip())
-        if m:
-            p = pathlib.Path(m.group(1).strip())
-            return p.resolve() if p.is_absolute() else (pathlib.Path(repo) / p).resolve()
-    return None
+    return _COMMON.git_dir(repo)
 
 
 def git_common_dir(repo):
-    """Resolve the shared Git common directory for main checkouts and linked worktrees."""
-    gd = git_dir(repo)
-    if gd is not None:
-        commondir_file = gd / "commondir"
-        if commondir_file.is_file():
-            rel = commondir_file.read_text(encoding="utf-8", errors="replace").strip()
-            if rel:
-                p = pathlib.Path(rel)
-                return p.resolve() if p.is_absolute() else (gd / p).resolve()
-        return gd
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            p = pathlib.Path(proc.stdout.strip())
-            return p.resolve() if p.is_absolute() else (pathlib.Path(repo) / p).resolve()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return None
+    return _COMMON.git_common_dir(repo)
 
 
 def git_exclude_file(repo):
     """Resolve info/exclude under the Git common directory."""
+    import subprocess
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "--git-path", "info/exclude"],
@@ -282,27 +267,25 @@ def default_director_dir(repo):
 
 def write_text_atomic(path, text):
     """Write UTF-8 LF text via staging temp file + os.replace."""
-    p = pathlib.Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(tmp, p)
+    _COMMON.write_text_atomic(path, text)
 
 
 def write_json_atomic(path, obj):
     """Write JSON atomically with stable LF formatting."""
-    write_text_atomic(path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+    _COMMON.write_json_atomic(path, obj)
 
 
 def compute_tools_hashes(tools_src):
-    """Return {rel_name: sha256} for managed files inside rules_root/tools."""
+    """Recursively return {posix_rel_path: sha256} for managed files inside rules_root/tools."""
+    root = pathlib.Path(tools_src)
     hashes = {}
-    for p in sorted(pathlib.Path(tools_src).iterdir()):
+    for p in sorted(root.rglob("*")):
         if not p.is_file():
             continue
-        if p.name == MANIFEST_NAME or p.suffix == ".pyc":
+        rel = p.relative_to(root)
+        if "__pycache__" in rel.parts or "fixtures" in rel.parts or rel.name == MANIFEST_NAME or p.suffix == ".pyc":
             continue
-        hashes[p.name] = hashlib.sha256(p.read_bytes()).hexdigest()
+        hashes[rel.as_posix()] = hashlib.sha256(p.read_bytes()).hexdigest()
     return hashes
 
 
@@ -327,8 +310,8 @@ def _dir_matches_manifest(folder, version_str, expected_hashes):
         return False, "corrupt-manifest"
     if old_ver != version_str:
         return False, old_ver
-    for fname, want_sha in expected_hashes.items():
-        fp = d / fname
+    for rel_name, want_sha in expected_hashes.items():
+        fp = d / rel_name
         if not fp.is_file():
             return False, old_ver
         if hashlib.sha256(fp.read_bytes()).hexdigest() != want_sha:
@@ -364,11 +347,11 @@ def _build_verified_tools_staging(director_dir, rules_root, expected_hashes, ver
         shutil.rmtree(staging)
     d.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, staging, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "fixtures", MANIFEST_NAME))
-    for fname, want_sha in expected_hashes.items():
-        sf = staging / fname
+    for rel_name, want_sha in expected_hashes.items():
+        sf = staging / rel_name
         if not sf.is_file() or hashlib.sha256(sf.read_bytes()).hexdigest() != want_sha:
             shutil.rmtree(staging, ignore_errors=True)
-            raise RuntimeError(f"staged tools integrity check failed for {fname}")
+            raise RuntimeError(f"staged tools integrity check failed for {rel_name}")
     manifest = {
         "schema_version": 1,
         "version": ver,
@@ -432,6 +415,33 @@ def sync_compat_tools_dir(director_dir, rules_root, expected_hashes):
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return backup
+
+
+def prune_old_tool_dirs(director_dir, active_ver_dir=None, keep=2):
+    """Retain only the newest `keep` tools_v* and .tools_backup_* dirs inside director_dir (0 disables GC)."""
+    if keep <= 0:
+        return []
+    d = pathlib.Path(director_dir)
+    if not d.is_dir():
+        return []
+    removed = []
+    active_key = _norm_path_key(active_ver_dir) if active_ver_dir else None
+    others_v = [
+        p for p in d.glob("tools_v*")
+        if p.is_dir() and (active_key is None or _norm_path_key(p) != active_key)
+    ]
+    others_v.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    keep_extra = max(0, keep - 1) if active_key else keep
+    for old in others_v[keep_extra:]:
+        shutil.rmtree(old, ignore_errors=True)
+        removed.append(old)
+
+    backups = [p for p in d.glob(".tools_backup_*") if p.is_dir()]
+    backups.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for old_b in backups[keep:]:
+        shutil.rmtree(old_b, ignore_errors=True)
+        removed.append(old_b)
+    return removed
 
 
 def build_sessions_config(sessions_path, register_directors, revoke_sessions, protected_dirs=()):
@@ -502,47 +512,15 @@ def _flag_passed(argv_list, *names):
 
 
 def _split_cmd_tokens(cmd_str):
-    if not cmd_str:
-        return []
-    toks = []
-    cur = []
-    quote = None
-    for ch in cmd_str:
-        if quote:
-            if ch == quote:
-                quote = None
-            else:
-                cur.append(ch)
-        elif ch in ('"', "'"):
-            quote = ch
-        elif ch.isspace():
-            if cur:
-                toks.append("".join(cur))
-                cur = []
-        else:
-            cur.append(ch)
-    if cur:
-        toks.append("".join(cur))
-    return toks
+    return _COMMON.split_cmd_tokens(cmd_str)
 
 
 def _extract_opt(tokens, flag):
-    for i, t in enumerate(tokens):
-        if t == flag and i + 1 < len(tokens):
-            return tokens[i + 1]
-        if t.startswith(flag + "="):
-            return t.split("=", 1)[1]
-    return None
+    return _COMMON.extract_opt(tokens, flag)
 
 
 def _extract_all_opts(tokens, flag):
-    out = []
-    for i, t in enumerate(tokens):
-        if t == flag and i + 1 < len(tokens):
-            out.append(tokens[i + 1])
-        elif t.startswith(flag + "="):
-            out.append(t.split("=", 1)[1])
-    return out
+    return _COMMON.extract_all_opts(tokens, flag)
 
 
 def infer_options_from_hooks(hooks_file, repo, director_dir, dir_active):
@@ -596,6 +574,15 @@ def infer_options_from_hooks(hooks_file, repo, director_dir, dir_active):
                 inferred["protect"] = extras
 
     bridge_grp = hdata.get("agydw-audit-and-bridge") if isinstance(hdata.get("agydw-audit-and-bridge"), dict) else {}
+    for blk in bridge_grp.get("PostToolUse") or []:
+        if isinstance(blk, dict):
+            for hk in blk.get("hooks") or []:
+                if isinstance(hk, dict) and isinstance(hk.get("command"), str):
+                    ptoks = _split_cmd_tokens(hk["command"])
+                    aud_p = _extract_opt(ptoks, "--audit-log") or _extract_opt(ptoks, "--log")
+                    def_audit = (director_dir / "audit" / "{worktree}.jsonl") if (director_dir and dir_active) else (pathlib.Path(repo) / ".agents" / "audit_{worktree}.jsonl")
+                    if aud_p and _norm_path_key(aud_p) != _norm_path_key(def_audit) and "audit_log" not in inferred:
+                        inferred["audit_log"] = aud_p
     for hk in bridge_grp.get("Stop") or []:
         if isinstance(hk, dict) and isinstance(hk.get("command"), str):
             stoks = _split_cmd_tokens(hk["command"])
@@ -609,8 +596,21 @@ def infer_options_from_hooks(hooks_file, repo, director_dir, dir_active):
     return inferred
 
 
+def _read_agydw_section(director_dir):
+    """Read director_work.json['agydw'] if present as valid dict."""
+    cfg_p = pathlib.Path(director_dir) / "director_work.json"
+    if not cfg_p.is_file():
+        return {}
+    try:
+        cfg = json.loads(cfg_p.read_text(encoding="utf-8-sig"))
+        sec = cfg.get("agydw") if isinstance(cfg, dict) else None
+        return dict(sec) if isinstance(sec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def load_persisted_options(director_dir, hooks_file, repo, dir_active):
-    """Load persisted setup options from .agydw_setup_state.json (falling back to hooks.json inference)."""
+    """Load persisted setup options from .agydw_setup_state.json, else hooks inference + director_work.json['agydw']."""
     state_p = pathlib.Path(director_dir) / SETUP_STATE_NAME
     if state_p.is_file():
         try:
@@ -619,7 +619,23 @@ def load_persisted_options(director_dir, hooks_file, repo, dir_active):
                 return data
         except (OSError, ValueError):
             pass
-    return infer_options_from_hooks(hooks_file, repo, director_dir, dir_active)
+    inferred = infer_options_from_hooks(hooks_file, repo, director_dir, dir_active)
+    agydw_sec = _read_agydw_section(director_dir)
+    if not hooks_file.is_file() and agydw_sec:
+        if agydw_sec.get("guard_mode") in ("remind", "ask", "block"):
+            inferred.setdefault("guard_mode", agydw_sec["guard_mode"])
+        if "enforce_resume" in agydw_sec and isinstance(agydw_sec["enforce_resume"], bool):
+            inferred.setdefault("enforce_resume", agydw_sec["enforce_resume"])
+        if "overwrite_utf8" in agydw_sec and isinstance(agydw_sec["overwrite_utf8"], bool):
+            inferred.setdefault("overwrite_utf8", agydw_sec["overwrite_utf8"])
+    elif agydw_sec:
+        if agydw_sec.get("guard_mode") in ("remind", "ask", "block") and inferred.get("guard_mode") in (None, "remind") and agydw_sec["guard_mode"] != "remind":
+            inferred["guard_mode"] = agydw_sec["guard_mode"]
+        if agydw_sec.get("enforce_resume") is True and "enforce_resume" not in inferred:
+            inferred["enforce_resume"] = True
+        if agydw_sec.get("overwrite_utf8") is True and "overwrite_utf8" not in inferred:
+            inferred["overwrite_utf8"] = True
+    return inferred
 
 
 def resolve_effective_args(a, argv_list, saved):
@@ -636,6 +652,8 @@ def resolve_effective_args(a, argv_list, saved):
             eff.overwrite_utf8 = bool(saved["overwrite_utf8"])
         if not _flag_passed(argv_list, "--no-copy-tools", "--copy-tools") and "no_copy_tools" in saved:
             eff.no_copy_tools = bool(saved["no_copy_tools"])
+        if not _flag_passed(argv_list, "--exclude-agents", "--no-exclude-agents") and "exclude_agents" in saved:
+            eff.exclude_agents = bool(saved["exclude_agents"])
         for attr, flag in (
             ("audit_log", "--audit-log"),
             ("resume_file", "--resume-file"),
@@ -650,14 +668,13 @@ def resolve_effective_args(a, argv_list, saved):
 
 
 def build_hooks_config(args, tools_dir, director_dir):
-    """Build Antigravity .agents/hooks.json dictionary with absolute Python & script paths."""
+    """Build Antigravity .agents/hooks.json with unified PostToolUse dispatcher and role-aware Stop."""
     py = q(sys.executable)
     if os.name == "nt" and py.startswith('"'):
         py = f"call {py}"
     tdir = pathlib.Path(tools_dir)
     guard = q(tdir / "agy_guard.py")
     rules_json = q(tdir / "guard_rules.json")
-    audit = q(tdir / "agy_audit.py")
     bridge = q(tdir / "agy_hook_bridge.py")
 
     state_dir = q(args.bridge_state or (director_dir / ".bridge_state" if director_dir else pathlib.Path(args.repo) / ".agents" / ".bridge_state"))
@@ -675,6 +692,8 @@ def build_hooks_config(args, tools_dir, director_dir):
             protect_dirs.append(ep)
     for pd in protect_dirs:
         guard_parts.append(f"--protect {q(pd)}")
+    if director_dir:
+        guard_parts.append(f"--pause-flag {q(pathlib.Path(director_dir) / 'PAUSE.flag')}")
     if sess_arg:
         guard_parts.append(f"--sessions {q(sess_arg)}")
     guard_parts.append(f"--audit {audit_log}")
@@ -683,17 +702,21 @@ def build_hooks_config(args, tools_dir, director_dir):
         guard_parts.append("--overwrite-utf8")
     guard_cmd = " ".join(guard_parts)
 
-    post_audit_cmd = f"{py} -B -I -X utf8 {audit} hook-append --log {audit_log}"
-    post_bridge_cmd = f"{py} -B -I -X utf8 {bridge} post-tool --state-dir {state_dir} --inject-scan"
+    post_unified_cmd = f"{py} -B -I -X utf8 {bridge} post-tool --audit-log {audit_log} --state-dir {state_dir} --inject-scan"
     session_cmd = f"{py} -B -I -X utf8 {bridge} session-start --resume {resume_path} --state-dir {state_dir} --banner"
     pre_inv_cmd = f"{py} -B -I -X utf8 {bridge} pre-invocation --state-dir {state_dir} --resume {resume_path}"
-    stop_cmd = f"{py} -B -I -X utf8 {bridge} stop-check --resume {resume_path} --repo {q(args.repo)} --state-dir {state_dir}" + (" --enforce-resume" if args.enforce_resume else "")
+    stop_parts = [f"{py} -B -I -X utf8 {bridge} stop-check --resume {resume_path} --repo {q(args.repo)} --state-dir {state_dir}"]
+    if sess_arg:
+        stop_parts.append(f"--sessions {q(sess_arg)}")
+    if args.enforce_resume:
+        stop_parts.append("--enforce-resume")
+    stop_cmd = " ".join(stop_parts)
 
     return {
         "agydw-guard": {
             "PreToolUse": [
                 {
-                    "matcher": "run_command|read_file|view_file|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|grep_search|find_by_name|list_dir|send_message|post_message",
+                    "matcher": "run_command|read_file|view_file|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|grep_search|find_by_name|list_dir|send_message|post_message|call_mcp_tool|mcp_.*|run_workflow|manage_task",
                     "hooks": [{"type": "command", "command": guard_cmd, "timeout": 15}],
                 }
             ]
@@ -704,8 +727,7 @@ def build_hooks_config(args, tools_dir, director_dir):
                 {
                     "matcher": "*",
                     "hooks": [
-                        {"type": "command", "command": post_audit_cmd, "timeout": 15},
-                        {"type": "command", "command": post_bridge_cmd, "timeout": 15},
+                        {"type": "command", "command": post_unified_cmd, "timeout": 15},
                     ],
                 }
             ],
@@ -733,7 +755,7 @@ def fill_placeholders(text, rules_root, repo, director_dir):
     return out
 
 
-def plan_director_scaffold(director_dir, rules_root, repo):
+def plan_director_scaffold(director_dir, rules_root, repo, eff=None):
     """Plan missing DIRECTOR/ scaffold files and directories without touching disk."""
     d = pathlib.Path(director_dir)
     subdirs = [d / sd for sd in ("orders", "reviews", "research", "evidence", "audit")]
@@ -799,18 +821,22 @@ def plan_director_scaffold(director_dir, rules_root, repo):
         cfg["director_worktree"] = primary.as_posix()
         if common_d is not None:
             cfg["project_git_common_dir"] = common_d.as_posix()
+        if eff is not None:
+            cfg["agydw"] = {
+                "guard_mode": eff.guard_mode,
+                "enforce_resume": bool(eff.enforce_resume),
+                "overwrite_utf8": bool(eff.overwrite_utf8),
+            }
         writes.append((cfg_dst, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", f"WRITE {cfg_dst.as_posix()}"))
     return subdirs, writes
 
 
-def plan_director_config_migration(director_dir, repo):
-    """Migrate legacy v2.6.0-agy.1/.2 director_work.json to include project_git_common_dir preserving custom keys."""
+def plan_director_config_migration(director_dir, repo, eff=None):
+    """Migrate director_work.json to keep git_common_dir and synced agydw settings while preserving custom keys."""
     cfg_dst = pathlib.Path(director_dir) / "director_work.json"
     if not cfg_dst.is_file():
         return None
     common_d = git_common_dir(repo)
-    if common_d is None:
-        return None
     try:
         cfg = json.loads(cfg_dst.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
@@ -818,12 +844,23 @@ def plan_director_config_migration(director_dir, repo):
     if not isinstance(cfg, dict):
         return None
     changed_fields = []
-    if not isinstance(cfg.get("project_git_common_dir"), str) or not cfg["project_git_common_dir"].strip():
+    if common_d is not None and (not isinstance(cfg.get("project_git_common_dir"), str) or not cfg["project_git_common_dir"].strip()):
         cfg["project_git_common_dir"] = common_d.as_posix()
         changed_fields.append("project_git_common_dir")
     if not isinstance(cfg.get("director_worktree"), str) or not cfg["director_worktree"].strip():
         cfg["director_worktree"] = primary_repo_root(repo).as_posix()
         changed_fields.append("director_worktree")
+    if eff is not None:
+        agydw_cur = cfg.get("agydw") if isinstance(cfg.get("agydw"), dict) else {}
+        agydw_next = dict(agydw_cur)
+        agydw_next.update({
+            "guard_mode": eff.guard_mode,
+            "enforce_resume": bool(eff.enforce_resume),
+            "overwrite_utf8": bool(eff.overwrite_utf8),
+        })
+        if agydw_next != cfg.get("agydw"):
+            cfg["agydw"] = agydw_next
+            changed_fields.append("agydw")
     if not changed_fields:
         return None
     return cfg_dst, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", f"MIGRATE {cfg_dst.as_posix()} (+{', '.join(changed_fields)})"
@@ -836,15 +873,15 @@ def plan_director_state_migration(director_dir, rules_root):
         return None
     txt = st_dst.read_text(encoding="utf-8-sig", errors="replace")
     want = pathlib.Path(rules_root).resolve().as_posix()
-    m = re.search(r"^(RULES_PATH\s*:\s*)(.+)$", txt, re.M)
+    m = re.search(r"^([ \t]*RULES_PATH[ \t]*:[ \t]*)(.+)$", txt, re.M)
     if not m or m.group(2).strip() == want:
         return None
     new_txt = txt[:m.start(2)] + want + txt[m.end(2):]
     return st_dst, new_txt, f"MIGRATE {st_dst.as_posix()} (RULES_PATH)"
 
 
-def merge_hooks_config(hooks_file, hooks_obj):
-    """Non-destructively merge agydw hook groups into existing .agents/hooks.json, keeping user enabled=false."""
+def merge_hooks_config(hooks_file, hooks_obj, re_enable=False):
+    """Non-destructively merge agydw hook groups into .agents/hooks.json, preserving custom keys & enabled=false."""
     try:
         existing = json.loads(hooks_file.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
@@ -856,10 +893,14 @@ def merge_hooks_config(hooks_file, hooks_obj):
     preserved = [k for k in existing if k not in hooks_obj]
     merged = dict(existing)
     for k, v in hooks_obj.items():
-        grp = json.loads(json.dumps(v))
         old_grp = existing.get(k)
-        if isinstance(old_grp, dict) and old_grp.get("enabled") is False:
+        grp = dict(old_grp) if isinstance(old_grp, dict) else {}
+        if re_enable:
+            grp.pop("enabled", None)
+        elif isinstance(old_grp, dict) and old_grp.get("enabled") is False:
             grp["enabled"] = False
+        for hk_k, hk_v in v.items():
+            grp[hk_k] = json.loads(json.dumps(hk_v))
         merged[k] = grp
     changed = (merged != existing)
     return merged, len(preserved), changed
@@ -893,7 +934,7 @@ def _is_director_work_plugin_entry(ep, old_rules_roots):
 
 
 def merge_plugins_config(plugins_file, plugin_parent, repo_path, old_rules_roots=()):
-    """Replace any existing director-work plugin entry cleanly while preserving unrelated/bundled plugins."""
+    """Replace director-work plugin entry cleanly while preserving custom entry keys and unrelated/bundled plugins."""
     try:
         existing = json.loads(plugins_file.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
@@ -914,14 +955,22 @@ def merge_plugins_config(plugins_file, plugin_parent, repo_path, old_rules_roots
             ep = pathlib.Path(ent["path"])
             if not ep.is_absolute():
                 ep = (pathlib.Path(repo_path) / ep).resolve()
+            excl = ent.get("exclude") if isinstance(ent.get("exclude"), list) else []
+            if "director-work" in excl:
+                new_entries.append(ent)
+                preserved_count += 1
+                continue
             if _is_director_work_plugin_entry(ep, old_rules_roots):
                 if _norm_path_key(ep) != target_key and _has_sibling_plugins(ep):
                     raise ValueError(
                         f"{plugins_file.as_posix()} entry '{ent['path']}' bundles director-work with sibling plugin(s); "
-                        "split plugin entries or pass --force instead of silently dropping siblings"
+                        "to keep siblings intact, add '\"exclude\": [\"director-work\"]' to that bundle entry "
+                        "(or split plugins into separate entries) instead of overwriting plugins.json"
                     )
                 if not replaced_dw:
-                    new_entries.append({"path": target_str})
+                    upd_ent = dict(ent)
+                    upd_ent["path"] = target_str
+                    new_entries.append(upd_ent)
                     replaced_dw = True
                 continue
         new_entries.append(ent)
@@ -976,13 +1025,17 @@ def validate_target_path_types(repo, director_dir, dir_active, sessions_path, ex
     return None
 
 
-def _norm_opt_path(val):
+def _norm_opt_path(val, base_dir=None):
     if not val:
         return None
+    s = os.path.expanduser(str(val).strip())
+    p = pathlib.Path(s)
+    if not p.is_absolute() and base_dir is not None:
+        p = pathlib.Path(base_dir) / p
     try:
-        return pathlib.Path(str(val)).resolve().as_posix()
+        return p.resolve().as_posix()
     except (OSError, ValueError):
-        return str(val).replace("\\", "/")
+        return p.as_posix() if hasattr(p, "as_posix") else s.replace("\\", "/")
 
 
 def main(argv=None):
@@ -1008,12 +1061,16 @@ def main(argv=None):
     ap.add_argument("--enforce-resume", action=argparse.BooleanOptionalAction, default=False,
                     help="enable or disable Stop hook RESUME_STATE freshness guard")
     ap.add_argument("--overwrite-utf8", action=argparse.BooleanOptionalAction, default=False,
-                    help="enable or disable PreToolUse overwrite for python -I -X utf8")
+                    help="enable or disable PreToolUse overwrite for python -X utf8")
     ap.add_argument("--init-director", action="store_true", help="scaffold missing DIRECTOR/ files from templates")
     ap.add_argument("--no-copy-tools", dest="no_copy_tools", action="store_true", default=False,
                     help="do not copy/upgrade tools/ into DIRECTOR/")
     ap.add_argument("--copy-tools", dest="no_copy_tools", action="store_false",
                     help="enable copying/upgrading tools/ into DIRECTOR/ (re-enables after --no-copy-tools)")
+    ap.add_argument("--exclude-agents", action=argparse.BooleanOptionalAction, default=True,
+                    help="exclude machine-bound .agents/hooks.json & plugins.json in Git common info/exclude (default: true)")
+    ap.add_argument("--enable", action="store_true", help="re-enable disabled agydw hook groups without replacing custom settings")
+    ap.add_argument("--keep-versions", type=int, default=2, help="number of recent tools_v* and .tools_backup_* dirs to keep (0=all, default=2)")
     ap.add_argument("--force", action="store_true", help="replace whole .agents/hooks.json / plugins.json instead of merging")
     ap.add_argument("--apply", action="store_true", help="write files after pre-flight succeeds (default: dry-run)")
     try:
@@ -1032,8 +1089,8 @@ def main(argv=None):
         print(f"AGY_SETUP: FAIL {rules_err}", file=sys.stderr)
         return 1
 
-    director_dir = pathlib.Path(a.director).resolve() if a.director else default_director_dir(repo)
-    plugin_parent = pathlib.Path(a.plugin).resolve() if a.plugin else (rules_root / "plugin")
+    director_dir = pathlib.Path(_norm_opt_path(a.director, base_dir=repo) if a.director else default_director_dir(repo)).resolve()
+    plugin_parent = pathlib.Path(_norm_opt_path(a.plugin, base_dir=repo) if a.plugin else (rules_root / "plugin")).resolve()
 
     # Pre-flight 1: project ownership guard on DIRECTOR folder
     own_ok, owner_desc = director_matches_repo(director_dir, repo)
@@ -1058,11 +1115,11 @@ def main(argv=None):
         # Load persisted setup options inside the project lock so concurrent structural updates never drop prior changes
         saved_opts = load_persisted_options(director_dir, hooks_file, repo, dir_active)
         eff = resolve_effective_args(a, argv_list, saved_opts)
-        eff.audit_log = _norm_opt_path(eff.audit_log)
-        eff.resume_file = _norm_opt_path(eff.resume_file)
-        eff.bridge_state = _norm_opt_path(eff.bridge_state)
-        eff.sessions = _norm_opt_path(eff.sessions)
-        eff.protect = [p for p in (_norm_opt_path(x) for x in (eff.protect or [])) if p]
+        eff.audit_log = _norm_opt_path(eff.audit_log, base_dir=repo)
+        eff.resume_file = _norm_opt_path(eff.resume_file, base_dir=repo)
+        eff.bridge_state = _norm_opt_path(eff.bridge_state, base_dir=repo)
+        eff.sessions = _norm_opt_path(eff.sessions, base_dir=repo)
+        eff.protect = [p for p in (_norm_opt_path(x, base_dir=repo) for x in (eff.protect or [])) if p]
 
         old_info = director_owner_info(director_dir)
         old_rules_roots = [old_info.get("rules_path")]
@@ -1074,7 +1131,8 @@ def main(argv=None):
                 pass
 
         has_existing_tools = (director_dir / "tools").is_dir() or any(director_dir.glob("tools_v*")) if director_dir.is_dir() else False
-        should_sync_tools = (not eff.no_copy_tools) and dir_active and (a.init_director or has_existing_tools) and (
+        explicit_copy = _flag_passed(argv_list, "--copy-tools")
+        should_sync_tools = (not eff.no_copy_tools) and dir_active and (a.init_director or has_existing_tools or explicit_copy) and (
             _norm_path_key(rules_root / "tools") != _norm_path_key(director_dir / "tools")
         )
         use_copied_tools = (not eff.no_copy_tools) and (should_sync_tools or has_existing_tools)
@@ -1106,7 +1164,8 @@ def main(argv=None):
         structural_flags = (
             "--init-director", "--force", "--guard-mode", "--profile", "--enforce-resume", "--no-enforce-resume",
             "--overwrite-utf8", "--no-overwrite-utf8", "--audit-log", "--resume-file", "--bridge-state", "--protect",
-            "--plugin", "--no-copy-tools", "--copy-tools", "--rules",
+            "--plugin", "--no-copy-tools", "--copy-tools", "--rules", "--enable", "--exclude-agents", "--no-exclude-agents",
+            "--keep-versions",
         )
         if sessions_path and (a.register_director or a.revoke_session) and not _flag_passed(argv_list, *structural_flags):
             tools_ok_for_fast = True
@@ -1152,22 +1211,23 @@ def main(argv=None):
                 return 1
 
         # Pre-flight 4: Git exclude calculation
+        want_excludes = BASE_LOCAL_EXCLUDES + (AGENTS_LOCAL_EXCLUDES if eff.exclude_agents else ())
         excl_missing = []
         excl_existing = ""
         if excl is not None:
             excl_existing = excl.read_text(encoding="utf-8", errors="replace") if excl.is_file() else ""
             have = {line.strip() for line in excl_existing.splitlines()}
-            excl_missing = [item for item in LOCAL_EXCLUDES if item not in have and item.rstrip("/") not in have]
+            excl_missing = [item for item in want_excludes if item not in have and item.rstrip("/") not in have and ".agents/" not in have]
 
         # Pre-flight 5: DIRECTOR/ scaffold & legacy migrations
         scaffold_dirs, scaffold_writes = ([], [])
         if a.init_director:
             try:
-                scaffold_dirs, scaffold_writes = plan_director_scaffold(director_dir, rules_root, repo)
+                scaffold_dirs, scaffold_writes = plan_director_scaffold(director_dir, rules_root, repo, eff=eff)
             except (OSError, ValueError) as exc:
                 print(f"AGY_SETUP: FAIL cannot prepare DIRECTOR scaffold: {exc}", file=sys.stderr)
                 return 1
-        migration_plan = plan_director_config_migration(director_dir, repo) if dir_active else None
+        migration_plan = plan_director_config_migration(director_dir, repo, eff=eff) if dir_active else None
         state_mig_plan = plan_director_state_migration(director_dir, rules_root) if dir_active else None
 
         # Pre-flight 6: .agents/hooks.json merge validation
@@ -1178,7 +1238,7 @@ def main(argv=None):
             hooks_should_write = True
         else:
             try:
-                hooks_write_data, n_preserved, changed = merge_hooks_config(hooks_file, hooks_obj)
+                hooks_write_data, n_preserved, changed = merge_hooks_config(hooks_file, hooks_obj, re_enable=bool(a.enable))
             except ValueError as exc:
                 print(f"AGY_SETUP: FAIL {exc}", file=sys.stderr)
                 return 1
@@ -1221,6 +1281,7 @@ def main(argv=None):
             "enforce_resume": bool(eff.enforce_resume),
             "overwrite_utf8": bool(eff.overwrite_utf8),
             "no_copy_tools": bool(eff.no_copy_tools),
+            "exclude_agents": bool(eff.exclude_agents),
             "audit_log": eff.audit_log,
             "resume_file": eff.resume_file,
             "bridge_state": eff.bridge_state,
@@ -1233,6 +1294,13 @@ def main(argv=None):
 
         actions = []
         notes = []
+        if os.name == "nt":
+            pct_paths = [p for p in (repo.as_posix(), director_dir.as_posix(), pathlib.Path(active_tools_dir).as_posix(), eff.audit_log or "") if "%" in p]
+            if pct_paths:
+                notes.append(
+                    f"WARN '%' character detected in Windows path(s) ({pct_paths[0]}): cmd /c expands %VAR% even inside double quotes; "
+                    "verify with agy_doctor.py --repo ... --probe-hooks or rename without '%'"
+                )
         if eff.profile == "director" and sessions_obj is not None and not any(
             (v == "director" or (isinstance(v, dict) and v.get("profile") == "director"))
             for v in (sessions_obj.get("sessions") or {}).values()
@@ -1316,6 +1384,9 @@ def main(argv=None):
 
         if dir_active and a.apply:
             write_json_atomic(director_dir / SETUP_STATE_NAME, setup_state_payload)
+            pruned = prune_old_tool_dirs(director_dir, active_ver_dir=ver_tools_dir, keep=eff.keep_versions)
+            if pruned:
+                actions.append(f"PRUNE {len(pruned)} old tools_v*/.tools_backup_* dir(s) (keep={eff.keep_versions})")
 
         for act in actions:
             print(("APPLY " if a.apply else "PLAN  ") + act)

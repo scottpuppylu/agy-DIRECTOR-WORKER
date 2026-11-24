@@ -2,6 +2,20 @@
 
 > **agydw（Antigravity 版）註記**：以下保留上游 `DIRECTOR-WORK v2.6.0` 實戰累積的 134 條教訓原文與「每輪必讀規則的理由」。在 Antigravity 上：壓縮門檻（`250000`）與免費 `context_probe.py` 未移植（詳見 `ANTIGRAVITY-PORT.md` 第 7 節）；Antigravity 原生以 `agy_guard.py` + 兩段式 `agy_hook_bridge.py` + 物理唯讀 `dw-blind-reviewer` + Swarm（`share`/`branch`/熱切換模型）+ `/browser`（`BROWSER_HOST_FACTS`）+ `ask_question` 對應執行。
 
+### 主題快速索引（按需檢索，不必全檔從頭讀）
+
+| 條目範圍 | 核心主題 | 代表機制／工具 |
+| :--- | :--- | :--- |
+| 第 1–10 條 | 測試前置審查、環境衛生與目錄結構 | `safety_gate.py`、`scope_check.py` |
+| 第 11–20 條 | 工單範圍控管、證據真實性與鎖定紀律 | `TESTS_LOCKED`、`evidence_record.py` |
+| 第 21–30 條 | 無損續航寫檔、閘門順序與狀態誤判防範 | `RESUME_STATE.md`、`gate_check.py` |
+| 第 31–47 條 | 交接溝通、Hook 啟動資料夾與防護模式 | `agy_guard.py`、`agy_doctor.py` |
+| 第 48–64 條 | 總監派工比例、Windows/Bash 陷阱與規則篇幅控制 | `python -B -I -X utf8`、`docs/05` |
+| 第 65–81 條 | 不可變快照、CAS 狀態機、路徑重疊與變異測試 | `selftest_agy.py`、真實路徑比對 |
+| 第 82–97 條 | 量測基準校正、模擬時鐘、審核視角與背景等待 | `SCHEDULE`、獨立對照基準 |
+| 第 98–114 條 | CI 發布門檻、極端邊界輸入、工作區清理與豁免 | GitHub Actions、`waiver.py` |
+| 第 115–134 條 | Conflict markers、防重複派工、INVALID 判定與去重 | `dispatch_check.py`、`ruler_check.py` |
+
 原專案幾週實戰中，每一條都真的發生過。寫新規則前先看這裡，避免重犯。
 
 1. **「已設好」卻沒驗證。** 寫了設定檔就回報完成，其實在某個環境沒生效。→ 「完成」只在看到結果後才能寫：跑、開、量，看到數字或畫面（`docs/04` 壓縮門檻的驗證步驟就是這樣來的）。

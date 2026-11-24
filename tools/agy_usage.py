@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Token & context usage report for agy-DIRECTOR-WORKER (agydw), reading Antigravity transcripts.
 
-Reads Antigravity's documented transcript.jsonl files across App, CLI, and IDE roots and
-reports counts only (never prints prompt text or tool contents).
+Reads Antigravity's documented transcript.jsonl files via single-pass streaming (low peak memory,
+last-wins deduplication by step_index) and reports counts only (never prints prompt text or tool contents).
 
 Empirically verified Antigravity PLANNER_RESPONSE token fields:
   input_tokens       uncached input tokens for that turn
@@ -28,15 +28,24 @@ import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-EFFORT_SUFFIX = re.compile(r"-(low|medium|high|xhigh|max)$", re.I)
 
 
-def load_sibling(name):
-    """Load a sibling Python module cleanly."""
-    spec = importlib.util.spec_from_file_location(f"_agy_use_{name}", HERE / f"{name}.py")
+def _load_common():
+    p = HERE / "agy_common.py"
+    spec = importlib.util.spec_from_file_location("_agy_use_common", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+_COMMON = _load_common()
+EFFORT_SUFFIX = re.compile(r"-(low|medium|high|xhigh|max)$", re.I)
+WS_KEYS = ("workspacePaths", "workspace_paths", "workspace", "workspacePath", "cwd", "project_dir", "projectDir")
+
+
+def load_sibling(name):
+    """Load and cache a sibling Python module cleanly."""
+    return _COMMON.load_sibling(HERE, name, prefix="_agy_use_")
 
 
 def parse_effort_from_model(model_name):
@@ -56,7 +65,7 @@ def to_local_iso(dt):
 
 def _case_norm(s):
     """Preserve exact casing on POSIX filesystems while staying case-insensitive on Windows."""
-    return s.lower() if os.name == "nt" else s
+    return _COMMON.case_norm(s)
 
 
 def compile_project_patterns(project_norm_list):
@@ -99,18 +108,10 @@ def _ws_path_variants(val):
 
 
 def _unwrap_arg_val(val):
-    if isinstance(val, str):
-        s = val.strip()
-        if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or s[0] in "[{"):
-            try:
-                return json.loads(s)
-            except ValueError:
-                return val
-    return val
+    return _COMMON.unwrap_arg_value(val)
 
 
-def extract_session_workspaces(steps):
-    """Extract normalized session/step-level workspace paths (excluding per-call tool Cwd)."""
+def _step_session_workspaces(st):
     out = []
     seen = set()
 
@@ -125,18 +126,48 @@ def extract_session_workspaces(steps):
             for item in v:
                 add_val(item)
 
-    ws_keys = ("workspacePaths", "workspace_paths", "workspace", "workspacePath", "cwd", "project_dir", "projectDir")
+    for k in WS_KEYS:
+        if k in st and st[k] is not None:
+            add_val(st[k])
+    meta = st.get("metadata")
+    if isinstance(meta, dict):
+        for k in WS_KEYS:
+            if k in meta and meta[k] is not None:
+                add_val(meta[k])
+    return out
+
+
+def _step_tool_cwds(st):
+    out = []
+    seen = set()
+    if st.get("type") != "PLANNER_RESPONSE":
+        return out
+    for tc in st.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        raw = _COMMON.parse_raw_args(tc)
+        for k in ("Cwd", "cwd", "workspace"):
+            if k in raw and raw[k] is not None:
+                v = _unwrap_arg_val(raw[k])
+                if isinstance(v, str):
+                    for cnorm in _ws_path_variants(v):
+                        if cnorm and cnorm not in seen:
+                            seen.add(cnorm)
+                            out.append(cnorm)
+    return out
+
+
+def extract_session_workspaces(steps):
+    """Extract normalized session/step-level workspace paths (excluding per-call tool Cwd)."""
+    out = []
+    seen = set()
     for st in steps:
         if not isinstance(st, dict):
             continue
-        for k in ws_keys:
-            if k in st and st[k] is not None:
-                add_val(st[k])
-        meta = st.get("metadata")
-        if isinstance(meta, dict):
-            for k in ws_keys:
-                if k in meta and meta[k] is not None:
-                    add_val(meta[k])
+        for cnorm in _step_session_workspaces(st):
+            if cnorm not in seen:
+                seen.add(cnorm)
+                out.append(cnorm)
     return out
 
 
@@ -144,31 +175,13 @@ def extract_tool_cwds(steps):
     """Extract normalized per-tool Cwd/workspace fields from PLANNER_RESPONSE tool_calls (unwrapped)."""
     out = []
     seen = set()
-
-    def add_val(v):
-        v = _unwrap_arg_val(v)
-        if isinstance(v, str):
-            for cnorm in _ws_path_variants(v):
-                if cnorm and cnorm not in seen:
-                    seen.add(cnorm)
-                    out.append(cnorm)
-
     for st in steps:
-        if not isinstance(st, dict) or st.get("type") != "PLANNER_RESPONSE":
+        if not isinstance(st, dict):
             continue
-        for tc in st.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue
-            raw = tc.get("args") if tc.get("args") is not None else tc.get("arguments")
-            if isinstance(raw, str):
-                try:
-                    raw = json.loads(raw)
-                except ValueError:
-                    raw = {}
-            if isinstance(raw, dict):
-                for k in ("Cwd", "cwd", "workspace"):
-                    if k in raw and raw[k] is not None:
-                        add_val(raw[k])
+        for cnorm in _step_tool_cwds(st):
+            if cnorm not in seen:
+                seen.add(cnorm)
+                out.append(cnorm)
     return out
 
 
@@ -202,6 +215,28 @@ def _unwrapped_tool_calls_text(tool_calls):
     return json.dumps(cleaned, ensure_ascii=False).replace("\\", "/")
 
 
+def _path_within_target(candidate, targets):
+    """True only when candidate IS target or lies inside target (never matching a parent folder to child target)."""
+    return any(candidate == tgt or candidate.startswith(tgt + "/") for tgt in targets)
+
+
+def _match_attribution_from_collections(session_ws, tool_cwds, has_text_hit, project_norm_list, project_patterns):
+    if not project_patterns and not project_norm_list:
+        return True, "unfiltered"
+    targets = [_case_norm(p.rstrip("/")) for p in (project_norm_list or []) if p.strip()]
+    if session_ws:
+        for wp in session_ws:
+            if _path_within_target(wp, targets):
+                return True, "structured_workspace"
+        return False, "structured_workspace_mismatch"
+    for cw in tool_cwds:
+        if _path_within_target(cw, targets):
+            return True, "structured_workspace"
+    if has_text_hit:
+        return True, "text_heuristic"
+    return False, "no_match"
+
+
 def classify_project_match(steps, project_norm_list, project_patterns):
     """Strictly trust session-level workspacePaths; keep tool Cwd non-exclusive against project files."""
     if not project_patterns and not project_norm_list:
@@ -211,15 +246,13 @@ def classify_project_match(steps, project_norm_list, project_patterns):
     session_ws = extract_session_workspaces(steps)
     if session_ws:
         for wp in session_ws:
-            for tgt in targets:
-                if wp == tgt or wp.startswith(tgt + "/") or tgt.startswith(wp + "/"):
-                    return True, "structured_workspace"
+            if _path_within_target(wp, targets):
+                return True, "structured_workspace"
         return False, "structured_workspace_mismatch"
 
     for cw in extract_tool_cwds(steps):
-        for tgt in targets:
-            if cw == tgt or cw.startswith(tgt + "/") or tgt.startswith(cw + "/"):
-                return True, "structured_workspace"
+        if _path_within_target(cw, targets):
+            return True, "structured_workspace"
 
     for st in steps:
         stype = st.get("type")
@@ -260,9 +293,62 @@ def safe_int_metric(val, invalid_counts, field_name):
     return 0
 
 
-def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
-    """Aggregate exact token, model, checkpoint, and tool metrics for one conversation."""
-    steps, resolved = agy_audit.load_transcript_steps(transcript_path)
+def _project_step(st, agy_audit, proj_patterns):
+    """Project one transcript step down to compact billing & attribution fields (last-wins dedup safe)."""
+    dt = agy_audit.parse_iso(st.get("created_at"))
+    stype = st.get("type")
+    step_ws = tuple(_step_session_workspaces(st))
+    step_cwds = tuple(_step_tool_cwds(st)) if stype == "PLANNER_RESPONSE" else ()
+
+    text_hit = False
+    if proj_patterns:
+        if stype == "USER_INPUT":
+            txt = _case_norm((st.get("content") or "").replace("\\", "/"))
+            text_hit = any(rx.search(txt) for rx in proj_patterns)
+        elif stype == "PLANNER_RESPONSE":
+            txt = _case_norm(_unwrapped_tool_calls_text(st.get("tool_calls") or []))
+            text_hit = any(rx.search(txt) for rx in proj_patterns)
+
+    if stype == "PLANNER_RESPONSE":
+        inv = collections.Counter()
+        m = st.get("model")
+        model = m if (isinstance(m, str) and m) else None
+        in_t = safe_int_metric(st.get("input_tokens"), inv, "input_tokens")
+        ca_t = safe_int_metric(st.get("cache_read_tokens"), inv, "cache_read_tokens")
+        out_t = safe_int_metric(st.get("output_tokens"), inv, "output_tokens")
+        tnames = tuple(str(tc["name"]) for tc in (st.get("tool_calls") or []) if isinstance(tc, dict) and tc.get("name"))
+        inv_pairs = tuple(inv.items())
+    else:
+        model, in_t, ca_t, out_t, tnames, inv_pairs = None, 0, 0, 0, (), ()
+
+    return (dt, stype, model, in_t, ca_t, out_t, tnames, inv_pairs, step_ws, step_cwds, text_hit)
+
+
+def summarize_conversation_streaming(conv_id, transcript_path, parent_cid, agy_audit, proj_norms=None, proj_patterns=None):
+    """Stream transcript.jsonl once in constant-projection memory (last-wins step_index, no full-file load)."""
+    tp = pathlib.Path(transcript_path)
+    if not tp.is_file():
+        raise FileNotFoundError(f"transcript not found: {tp}")
+    resolved = tp.resolve()
+
+    by_idx = {}
+    anon_key = -1
+    with open(resolved, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                st = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(st, dict):
+                continue
+            s_idx = st.get("step_index")
+            key = s_idx if isinstance(s_idx, int) and not isinstance(s_idx, bool) else anon_key
+            if key == anon_key:
+                anon_key -= 1
+            by_idx[key] = _project_step(st, agy_audit, proj_patterns)
+
     started_dt = None
     last_dt = None
     models = collections.Counter()
@@ -276,38 +362,49 @@ def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
     checkpoints = 0
     last_model = None
     invalid_counts = collections.Counter()
+    session_ws = []
+    ws_seen = set()
+    tool_cwds = []
+    cwd_seen = set()
+    has_text_hit = False
 
-    for st in steps:
-        dt = agy_audit.parse_iso(st.get("created_at"))
+    for dt, stype, model, in_t, ca_t, out_t, tnames, inv_pairs, sws, scwds, t_hit in by_idx.values():
         if dt:
             if started_dt is None or dt < started_dt:
                 started_dt = dt
             if last_dt is None or dt > last_dt:
                 last_dt = dt
-        stype = st.get("type")
+        for w in sws:
+            if w not in ws_seen:
+                ws_seen.add(w)
+                session_ws.append(w)
+        for c in scwds:
+            if c not in cwd_seen:
+                cwd_seen.add(c)
+                tool_cwds.append(c)
+        if t_hit:
+            has_text_hit = True
         if stype == "CHECKPOINT":
             checkpoints += 1
         elif stype == "PLANNER_RESPONSE":
             turns += 1
-            m = st.get("model")
-            if isinstance(m, str) and m:
-                models[m] += 1
-                last_model = m
-            in_t = safe_int_metric(st.get("input_tokens"), invalid_counts, "input_tokens")
-            ca_t = safe_int_metric(st.get("cache_read_tokens"), invalid_counts, "cache_read_tokens")
-            out_t = safe_int_metric(st.get("output_tokens"), invalid_counts, "output_tokens")
+            if model:
+                models[model] += 1
+                last_model = model
             uncached_in += in_t
             cache_read += ca_t
             output_tok += out_t
+            for fk, fv in inv_pairs:
+                invalid_counts[fk] += fv
             prompt_t = in_t + ca_t
             if prompt_t > 0:
                 last_prompt = prompt_t
                 if prompt_t > peak_prompt:
                     peak_prompt = prompt_t
-            for tc in st.get("tool_calls") or []:
-                if isinstance(tc, dict) and tc.get("name"):
-                    tool_counts[str(tc["name"])] += 1
+            for tn in tnames:
+                tool_counts[tn] += 1
 
+    matched, attr_mode = _match_attribution_from_collections(session_ws, tool_cwds, has_text_hit, proj_norms, proj_patterns)
     total_prompt = uncached_in + cache_read
     cache_pct = round(100.0 * cache_read / total_prompt, 1) if total_prompt > 0 else 0.0
     local_dt = started_dt.astimezone() if started_dt else None
@@ -324,7 +421,7 @@ def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
         "models": dict(models),
         "effort": parse_effort_from_model(last_model),
         "turns": turns,
-        "steps": len(steps),
+        "steps": len(by_idx),
         "checkpoints": checkpoints,
         "input_tokens": uncached_in,
         "cache_read_tokens": cache_read,
@@ -336,16 +433,23 @@ def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
         "tool_calls": sum(tool_counts.values()),
         "tools": dict(tool_counts),
         "invalid_metric_fields": dict(invalid_counts),
-        "_steps": steps,
+        "_matched": matched,
+        "_attr_mode": attr_mode,
         "_started_dt": started_dt,
     }
 
 
+def summarize_conversation(conv_id, transcript_path, parent_cid, agy_audit):
+    """Backwards-compatible wrapper summarizing one conversation without loading full transcripts."""
+    row = summarize_conversation_streaming(conv_id, transcript_path, parent_cid, agy_audit)
+    row.pop("_matched", None)
+    row.pop("_attr_mode", None)
+    return row
+
+
 def write_out(path, payload):
-    """Write JSON report to path atomically enough for local use."""
-    p = pathlib.Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8", newline="\n")
+    """Write JSON report to path atomically."""
+    _COMMON.write_json_atomic(path, payload)
 
 
 def effort_check(order_path, sessions):
@@ -401,33 +505,32 @@ def main(argv=None):
     assigned_cids = set()
     matched_raw_cids = set()
     for cid, tp, parent_cid in sources:
-        tp_key = os.path.normcase(pathlib.Path(tp).resolve().as_posix())
+        tp_key = _COMMON.norm_path_key(tp)
         if tp_key in seen_paths:
             continue
         seen_paths.add(tp_key)
         try:
-            row = summarize_conversation(cid, tp, parent_cid, agy_audit)
+            row = summarize_conversation_streaming(cid, tp, parent_cid, agy_audit, proj_norms=proj_norms, proj_patterns=proj_patterns)
         except OSError:
             continue
-        steps_tmp = row.pop("_steps", [])
+        matched = row.pop("_matched", True)
+        attr_mode = row.pop("_attr_mode", "unfiltered")
         row.pop("_started_dt", None)
         if a.project_dir:
-            matched, attr_mode = classify_project_match(steps_tmp, proj_norms, proj_patterns)
-            del steps_tmp
             if not parent_cid and not matched:
                 continue
             if parent_cid and parent_cid not in matched_raw_cids and not matched:
                 continue
             row["attribution_mode"] = attr_mode if matched else "inherited_parent"
         else:
-            del steps_tmp
             row["attribution_mode"] = "unfiltered"
+        # Record parent match BEFORE --since/--until filtering so newer child subagents keep inherited attribution
+        matched_raw_cids.add(cid)
         sdate = row["started_date"]
         if a.since and sdate != "UNKNOWN" and sdate < a.since:
             continue
         if a.until and sdate != "UNKNOWN" and sdate > a.until:
             continue
-        matched_raw_cids.add(cid)
         out_cid = cid
         if out_cid in assigned_cids:
             h8 = hashlib.sha256(tp_key.encode("utf-8")).hexdigest()[:8]

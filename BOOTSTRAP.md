@@ -118,7 +118,7 @@ python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --rules <RULES> --
 1. 所有要 PO 拍板或動手的事都同步記進 `<WS>/DIRECTOR/PO_PENDING.md`（`ID` / `STATUS` / `QUESTION` / `QUESTION_TOOL` / `OPTIONS` / `RECOMMENDED` / `IMAGES` / `SOURCE` / `ANSWER` / `RESOLUTION`）。
 2. **問法紀律**：一次最多 3 題，每個選項寫一句影響，推薦項置頂並加註 `(Recommended)`。若需要 PO 看視覺對照圖，先把圖片或 Artifact 放在同一則對話訊息中，再呼叫 `ask_question`（子代理不可呼叫 `ask_question`，必須交回總監）。
 3. **收回填寫**：收到答案後立刻把原文貼入 `ANSWER`、更新 `STATUS: answered`，處理完改為 `closed` 並寫明 `RESOLUTION`。
-4. **驗證格式**：執行 `python -B -I -X utf8 <RULES>/tools/agy_setup_check.py --strict <WS>/DIRECTOR`，必須 `exit 0`。
+4. **驗證格式**：執行 `python -B -I -X utf8 <RULES>/tools/agy_setup_check.py <WS>/DIRECTOR-<repo> --repo <REPO> --strict`，必須 `exit 0`。
 
 ---
 
@@ -168,7 +168,7 @@ Antigravity 的全域開關位於使用者設定目錄（`~/.gemini/config/confi
 確認 `<WS>/DIRECTOR/director_work.json` 裡的 `"safety"` 與 `"order_limits"` 設定正確（對齊 `director_work.example.json`）：
 - `safety.tests_first: true`（Standard / Strict 測試先鎖後開工）
 - `safety.plan_gate: true`（Standard / Strict 先繳 `PLAN.md` 經 `PLAN_APPROVED` 後才改碼）
-- `safety.spec_review_for_standard: false`（Strict 本身強迫執行規格審查；將此開關設為 `true` 時 Standard 亦同開 `dw-blind-reviewer`）
+- `safety.spec_review_for_standard: true`（已於範例設定檔預設開啟，讓 Standard 與 Strict 同享 `dw-blind-reviewer` 規格盲審；若要略過可於專案設定改回 `false`）
 - `safety.stop_after_rounds: 1`（同一根因卡超過指定輪數停止回報）
 - `order_limits`（頂層鍵）：`max_files_per_order`（預設 3 檔）與 `max_lines_per_order`（預設 200 行）
 安全開關只能由 PO 在對話或 `PO_PENDING.md` 親自同意才能放寬或關閉。

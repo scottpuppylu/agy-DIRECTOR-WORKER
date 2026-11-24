@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Antigravity hash-chained action audit & loop/injection scanner (2.6.0-agy.5).
+"""Antigravity hash-chained action audit & loop/injection scanner (2.6.0-agy.6).
 
 Reuses upstream tools/audit_log.py (hash chain, locking, verification), tools/loop_guard.py
 (loop detection), tools/inject_scan.py (prompt injection scanning), and tools/secret_mask.py
@@ -31,7 +31,19 @@ import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-REBUILD_VERSION = "2.6.0-agy.5"
+
+
+def _load_common():
+    p = HERE / "agy_common.py"
+    spec = importlib.util.spec_from_file_location("_agy_aud_common", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_COMMON = _load_common()
+
+REBUILD_VERSION = "2.6.0-agy.6"
 READ_TOOLS = {"read_file", "view_file", "list_dir"}
 SHELL_TOOL_NAMES = {"run_command", "bash", "powershell", "monitor"}
 SUBAGENT_TOOLS = {"invoke_subagent", "swarm", "Agent", "Task"}
@@ -41,19 +53,16 @@ ERROR_STATUSES = {"ERROR", "FAILED", "FAIL", "TIMED_OUT", "TIMEOUT"}
 INTERRUPTED_STATUSES = {"CANCELED", "CANCELLED", "INTERRUPTED", "ABORTED"}
 CREATED_RE = re.compile(r"^Created At:\s*(\S+)", re.M)
 COMPLETED_RE = re.compile(r"^Completed At:\s*(\S+)", re.M)
-EXIT_NONZERO_RE = re.compile(r"^Command exited with code (-?[1-9]\d*)\.\s*$", re.M)
-EXIT_ZERO_RE = re.compile(r"^Command exited with code 0\.\s*$", re.M)
-OUTPUT_SECTION_RE = re.compile(r"\r?\n(?:Command output|Output):\s*(?:\r?\n|$)")
-STILL_RUNNING_RE = re.compile(r"\b(?:process still running|command is still running|running in background)\b", re.I)
-SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([0-9a-f-]{8,})"')
+EXIT_NONZERO_RE = re.compile(r"^(?:Command exited with code (-?[1-9]\d*)\.?|Exit code:\s*(-?[1-9]\d*))\s*$", re.M | re.I)
+EXIT_ZERO_RE = re.compile(r"^(?:Command exited with code 0\.?|Exit code:\s*0)\s*$", re.M | re.I)
+OUTPUT_SECTION_RE = re.compile(r"(?:^|\r?\n)(?:Command output|Output):[ \t]*(?:\r?\n|$)")
+STILL_RUNNING_RE = re.compile(r"\b(?:process still running|command (?:is )?still running|running in background)\b", re.I)
+SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([0-9a-f-]{8,})"', re.I)
 
 
 def load_sibling(name):
-    """Load a sibling module cleanly without altering sys.path."""
-    spec = importlib.util.spec_from_file_location(f"_agy_aud_{name}", HERE / f"{name}.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    """Load and cache a sibling module cleanly without altering sys.path."""
+    return _COMMON.load_sibling(HERE, name, prefix="_agy_aud_")
 
 
 def default_brain_roots():
@@ -69,14 +78,7 @@ def default_brain_roots():
 
 def unwrap_arg_value(val):
     """Unwrap Antigravity PLANNER_RESPONSE JSON-quoted string args (e.g. '\"git status\"' -> 'git status')."""
-    if isinstance(val, str):
-        s = val.strip()
-        if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or s[0] in "[{"):
-            try:
-                return json.loads(s)
-            except ValueError:
-                return val
-    return val
+    return _COMMON.unwrap_arg_value(val)
 
 
 def normalize_tool_and_input(raw_name, raw_args):
@@ -92,13 +94,13 @@ def normalize_tool_and_input(raw_name, raw_args):
                 norm_input[k] = args[k]
         return shell_tool, raw_name, norm_input
     if low in ("read_file", "view_file"):
-        path = args.get("Path") or args.get("AbsolutePath") or args.get("file_path")
+        path = args.get("Path") or args.get("AbsolutePath") or args.get("file_path") or args.get("path")
         norm = dict(args)
         if path and "file_path" not in norm:
             norm["file_path"] = path
         return raw_name, raw_name, norm
     if low in ("write_file", "write_to_file", "edit_file", "replace_file_content", "multi_replace_file_content"):
-        path = args.get("Path") or args.get("TargetFile") or args.get("file_path")
+        path = args.get("Path") or args.get("TargetFile") or args.get("file_path") or args.get("path")
         norm = dict(args)
         if path and "file_path" not in norm:
             norm["file_path"] = path
@@ -123,8 +125,22 @@ def _extract_shell_header(body):
     """Return only the Antigravity step header before stdout/Command output so body text never skews exit status."""
     if not body:
         return ""
+    if body.lstrip().startswith(("Output:", "Command output:")) and re.match(r"^[ \t]*(?:Command output|Output):[ \t]*(?:\r?\n|$)", body):
+        return ""
     parts = OUTPUT_SECTION_RE.split(body, maxsplit=1)
     return parts[0]
+
+
+def _extract_step_duration_ms(content):
+    """Extract duration_ms from Created At / Completed At headers when both timestamps exist."""
+    if not isinstance(content, str) or not content:
+        return None
+    m1, m2 = CREATED_RE.search(content), COMPLETED_RE.search(content)
+    if m1 and m2:
+        t1, t2 = parse_iso(m1.group(1)), parse_iso(m2.group(1))
+        if t1 and t2:
+            return max(0, int((t2 - t1).total_seconds() * 1000))
+    return None
 
 
 def classify_step_outcome(status_val, content, err=None, is_shell=True):
@@ -155,12 +171,7 @@ def classify_step_outcome(status_val, content, err=None, is_shell=True):
 
 def parse_step_timing_and_error(content, status, is_shell=True):
     """Extract duration_ms and error status from an Antigravity GENERIC step body."""
-    duration_ms = None
-    m1, m2 = CREATED_RE.search(content), COMPLETED_RE.search(content)
-    if m1 and m2:
-        t1, t2 = parse_iso(m1.group(1)), parse_iso(m2.group(1))
-        if t1 and t2:
-            duration_ms = max(0, int((t2 - t1).total_seconds() * 1000))
+    duration_ms = _extract_step_duration_ms(content)
     _, res_status = classify_step_outcome(status, content, is_shell=is_shell)
     is_err = (res_status == "error")
     is_int = (res_status == "interrupted")
@@ -180,91 +191,37 @@ def _extract_call_id(obj, keys):
 
 def parse_raw_args(tc):
     """Extract tool call args dict supporting both Antigravity `args` and `arguments` (dict or JSON string)."""
-    if not isinstance(tc, dict):
-        return {}
-    raw = tc.get("args")
-    if raw is None:
-        raw = tc.get("arguments")
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except ValueError:
-            return {}
-    return raw if isinstance(raw, dict) else {}
+    return _COMMON.parse_raw_args(tc)
 
 
 def _scan_tail_for_step(path, step_idx, require_generic=False, max_scan_bytes=2 * 1024 * 1024):
-    """Scan JSONL backwards in bounded non-overlapping windows using a byte prefilter before JSON parsing."""
-    if not path.is_file() or step_idx is None:
-        return None
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return None
-    if size <= 0:
-        return None
-    needle = str(step_idx).encode("ascii")
-    windows = (65536, 196608, 786432, 1048576)
-    pos = size
-    scanned = 0
-    carry = b""
-    idx = 0
-    try:
-        with open(path, "rb") as fh:
-            while pos > 0 and scanned < max_scan_bytes:
-                win = windows[idx] if idx < len(windows) else windows[-1]
-                idx += 1
-                win = min(win, pos, max_scan_bytes - scanned)
-                if win <= 0:
-                    break
-                start = pos - win
-                fh.seek(start)
-                buf = fh.read(win) + carry
-                pos = start
-                scanned += win
-                if start > 0:
-                    nl = buf.find(b"\n")
-                    if nl >= 0:
-                        carry = buf[:nl + 1]
-                        complete = buf[nl + 1:]
-                    else:
-                        carry = buf
-                        continue
-                else:
-                    carry = b""
-                    complete = buf
-                for line in reversed(complete.splitlines()):
-                    if not line.strip() or needle not in line:
-                        continue
-                    try:
-                        obj = json.loads(line.decode("utf-8", errors="replace"))
-                    except ValueError:
-                        continue
-                    if isinstance(obj, dict) and obj.get("step_index") == step_idx:
-                        if require_generic and obj.get("type") != "GENERIC":
-                            continue
-                        return obj
-    except OSError:
-        return None
-    return None
+    """Scan JSONL backwards in bounded windows using shared exact step_index prefilter."""
+    return _COMMON.scan_tail_for_step(path, step_idx, require_generic=require_generic, max_scan_bytes=max_scan_bytes)
 
 
-def find_step_in_transcript(transcript_path, step_idx):
-    """Locate step_idx quickly from transcript.jsonl (tail-first), falling back to transcript_full.jsonl only if truncated."""
+def find_step_info_in_transcript(transcript_path, step_idx):
+    """Locate GENERIC step_idx in transcript tail; return (found, status, body, duration_ms)."""
     if not transcript_path or step_idx is None:
-        return False, None, ""
+        return False, None, "", None
     tp = pathlib.Path(transcript_path)
-    obj = _scan_tail_for_step(tp, step_idx, require_generic=True) or _scan_tail_for_step(tp, step_idx, require_generic=False)
+    obj = _scan_tail_for_step(tp, step_idx, require_generic=True)
     if obj is None:
-        return False, None, ""
+        return False, None, "", None
     if obj.get("truncated_fields"):
         full = tp.with_name("transcript_full.jsonl")
         if full.is_file() and full.resolve() != tp.resolve():
-            full_obj = _scan_tail_for_step(full, step_idx, require_generic=(obj.get("type") == "GENERIC")) or _scan_tail_for_step(full, step_idx, require_generic=False)
+            full_obj = _scan_tail_for_step(full, step_idx, require_generic=True)
             if full_obj is not None:
                 obj = full_obj
-    content = obj.get("content")
-    return True, obj.get("status"), (content if isinstance(content, str) else "")
+    raw_content = obj.get("content")
+    body = raw_content if isinstance(raw_content, str) else ""
+    return True, obj.get("status"), body, _extract_step_duration_ms(body)
+
+
+def find_step_in_transcript(transcript_path, step_idx):
+    """Locate GENERIC step_idx quickly from transcript.jsonl; return (found, status, body)."""
+    found, status_val, body, _ = find_step_info_in_transcript(transcript_path, step_idx)
+    return found, status_val, body
 
 
 def load_transcript_steps_with_sources(transcript_path):
@@ -331,19 +288,91 @@ def load_transcript_steps(transcript_path):
     return steps, tp
 
 
+def _discover_child_cids_streaming(path):
+    """Stream a transcript line-by-line to collect subagent conversationIds referenced by SUBAGENT_TOOLS."""
+    cids = []
+    seen_cids = set()
+    has_sub_turn = False
+    trunc_generic_idxs = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                if "PLANNER_RESPONSE" not in line and "GENERIC" not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                stype = obj.get("type")
+                if stype == "PLANNER_RESPONSE":
+                    has_sub_turn = any(
+                        isinstance(tc, dict) and tc.get("name") in SUBAGENT_TOOLS
+                        for tc in (obj.get("tool_calls") or [])
+                    )
+                elif stype == "GENERIC" and has_sub_turn:
+                    if obj.get("truncated_fields") and obj.get("step_index") is not None:
+                        trunc_generic_idxs.add(obj["step_index"])
+                    body = obj.get("content") or ""
+                    if isinstance(body, str) and "conversationId" in body:
+                        for scid in SUBAGENT_CID_RE.findall(body):
+                            k = scid.lower()
+                            if k not in seen_cids:
+                                seen_cids.add(k)
+                                cids.append(scid)
+    except OSError:
+        return cids
+
+    if trunc_generic_idxs:
+        full_p = pathlib.Path(path).with_name("transcript_full.jsonl")
+        if full_p.is_file() and _COMMON.norm_path_key(full_p) != _COMMON.norm_path_key(path):
+            try:
+                with open(full_p, "r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if "GENERIC" not in line or "conversationId" not in line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(obj, dict) and obj.get("step_index") in trunc_generic_idxs:
+                            body = obj.get("content") or ""
+                            if isinstance(body, str):
+                                for scid in SUBAGENT_CID_RE.findall(body):
+                                    k = scid.lower()
+                                    if k not in seen_cids:
+                                        seen_cids.add(k)
+                                        cids.append(scid)
+            except OSError:
+                pass
+    return cids
+
+
 def discover_transcripts(transcript_files, conversations, brain_roots, include_subagents):
-    """Resolve list of (conv_id, transcript_path, parent_conv_id) in deterministic order."""
+    """Resolve list of (conv_id, transcript_path, parent_conv_id) in parent-before-child order."""
     roots = [pathlib.Path(r) for r in (brain_roots or [])] or default_brain_roots()
-    seen = set()
+    nodes = {}
+    seed_order = []
+    parent_of = {}
+    children_of = collections.defaultdict(list)
     queue = []
+
+    def add_seed(cid, p_res):
+        k = _COMMON.norm_path_key(p_res)
+        if k not in nodes:
+            nodes[k] = (cid, p_res)
+            parent_of[k] = None
+            seed_order.append(k)
+            queue.append((k, cid, p_res))
+        return k
 
     for tf in transcript_files or []:
         p = pathlib.Path(tf).resolve()
         cid = p.parent.parent.parent.name if p.parent.name == "logs" and p.parent.parent.name == ".system_generated" else p.stem
-        key = str(p).lower()
-        if key not in seen:
-            seen.add(key)
-            queue.append((cid, p, None))
+        add_seed(cid, p)
 
     for cid in conversations or []:
         found = None
@@ -352,46 +381,72 @@ def discover_transcripts(transcript_files, conversations, brain_roots, include_s
             if cand.is_file():
                 found = cand.resolve()
                 break
-            # Allow prefix match
             for sub in sorted(root.glob(f"{cid}*/.system_generated/logs/transcript.jsonl")):
                 found = sub.resolve()
                 cid = found.parent.parent.parent.name
                 break
             if found:
                 break
-        if found and str(found).lower() not in seen:
-            seen.add(str(found).lower())
-            queue.append((cid, found, None))
+        if found:
+            add_seed(cid, found)
 
     if not transcript_files and not conversations:
         for root in roots:
             for cand in sorted(root.glob("*/.system_generated/logs/transcript.jsonl")):
                 cid = cand.parent.parent.parent.name
-                p = cand.resolve()
-                if str(p).lower() not in seen:
-                    seen.add(str(p).lower())
-                    queue.append((cid, p, None))
+                add_seed(cid, cand.resolve())
+
+    def would_create_cycle(parent_k, child_k):
+        cur = parent_k
+        while cur is not None:
+            if cur == child_k:
+                return True
+            par_cid = parent_of.get(cur)
+            if par_cid is None:
+                return False
+            cur = next((nk for nk, (ncid, _) in nodes.items() if ncid == par_cid), None)
+        return False
+
+    q_idx = 0
+    while include_subagents and q_idx < len(queue):
+        key, cid, path = queue[q_idx]
+        q_idx += 1
+        if not path.is_file():
+            continue
+        for sub_cid in _discover_child_cids_streaming(path):
+            for root in [path.parent.parent.parent.parent] + roots:
+                sub_tp = root / sub_cid / ".system_generated" / "logs" / "transcript.jsonl"
+                if sub_tp.is_file():
+                    sp = sub_tp.resolve()
+                    sk = _COMMON.norm_path_key(sp)
+                    if sk not in nodes:
+                        nodes[sk] = (sub_cid, sp)
+                        parent_of[sk] = cid
+                        children_of[key].append(sk)
+                        queue.append((sk, sub_cid, sp))
+                    elif sk != key and parent_of.get(sk) is None and not would_create_cycle(key, sk):
+                        parent_of[sk] = cid
+                        if sk not in children_of[key]:
+                            children_of[key].append(sk)
+                    break
 
     out = []
-    idx = 0
-    while idx < len(queue):
-        cid, path, parent = queue[idx]
-        idx += 1
-        out.append((cid, path, parent))
-        if include_subagents and path.is_file():
-            calls, _, _ = extract_calls_from_transcript(cid, path, parent_cid=parent)
-            for c in calls:
-                if c["tool_raw"] not in SUBAGENT_TOOLS:
-                    continue
-                for sub_cid in SUBAGENT_CID_RE.findall(c.get("content") or ""):
-                    for root in [path.parent.parent.parent.parent] + roots:
-                        sub_tp = root / sub_cid / ".system_generated" / "logs" / "transcript.jsonl"
-                        if sub_tp.is_file():
-                            sp = sub_tp.resolve()
-                            if str(sp).lower() not in seen:
-                                seen.add(str(sp).lower())
-                                queue.append((sub_cid, sp, cid))
-                            break
+    emitted = set()
+
+    def emit_subtree(k):
+        if k in emitted:
+            return
+        emitted.add(k)
+        cid, p = nodes[k]
+        out.append((cid, p, parent_of.get(k)))
+        for ck in children_of.get(k, ()):
+            emit_subtree(ck)
+
+    for k in seed_order:
+        if parent_of.get(k) is None:
+            emit_subtree(k)
+    for k in seed_order:
+        emit_subtree(k)
     return out
 
 
@@ -408,7 +463,12 @@ def _build_call_record(conv_id, parent_cid, model_seen, tc, tc_id, p_step, p_ts,
         norm_input = {"unmatched_tool_call_id": tc_id} if tc_id else {"unmatched_step_index": st.get("step_index")}
     content = st.get("content") or ""
     status_val = st.get("status")
-    is_shell = (raw_name.lower() in SHELL_TOOL_NAMES) or (tool.lower() in SHELL_TOOL_NAMES) or (orphan and EXIT_ZERO_RE.search(_extract_shell_header(content)) is not None) or (orphan and EXIT_NONZERO_RE.search(_extract_shell_header(content)) is not None)
+    hdr = _extract_shell_header(content)
+    is_shell = (
+        (raw_name.lower() in SHELL_TOOL_NAMES)
+        or (tool.lower() in SHELL_TOOL_NAMES)
+        or (orphan and (EXIT_ZERO_RE.search(hdr) is not None or EXIT_NONZERO_RE.search(hdr) is not None))
+    )
     dur, is_err, is_int = parse_step_timing_and_error(content, status_val, is_shell=is_shell)
     kind, res_status = classify_step_outcome(status_val, content, is_shell=is_shell)
     ts_str = st.get("created_at") or p_ts
@@ -506,7 +566,7 @@ def extract_calls_detailed(conv_id, transcript_path, parent_cid=None):
                 if isinstance(tc, dict):
                     tc_id = _extract_call_id(tc, ("id", "call_id", "tool_call_id", "toolCallId", "tool_use_id"))
                     batch_pending.append((tc, tc_id, st.get("step_index"), st.get("created_at")))
-        elif stype == "GENERIC" and batch_pending:
+        elif stype == "GENERIC":
             step_cid = _extract_call_id(st, ("tool_call_id", "toolCallId", "call_id", "callId", "tool_use_id"))
             batch_generics.append((st, step_cid))
 
@@ -522,33 +582,7 @@ def extract_calls_from_transcript(conv_id, transcript_path, parent_cid=None):
 
 def _find_git_root_and_common(start_path):
     """Walk ancestors for .git dir or linked-worktree .git file without spawning git."""
-    try:
-        cur = pathlib.Path(start_path).resolve()
-    except OSError:
-        return None, None, False
-    if cur.is_file():
-        cur = cur.parent
-    for cand in (cur, *cur.parents):
-        dot = cand / ".git"
-        if dot.is_dir():
-            return cand, dot.resolve(), False
-        if dot.is_file():
-            try:
-                txt = dot.read_text(encoding="utf-8", errors="replace").strip()
-                m = re.match(r"gitdir:\s*(.+)", txt)
-                if m:
-                    gp = pathlib.Path(m.group(1).strip())
-                    gd = gp.resolve() if gp.is_absolute() else (cand / gp).resolve()
-                    cd_file = gd / "commondir"
-                    if cd_file.is_file():
-                        rel = cd_file.read_text(encoding="utf-8", errors="replace").strip()
-                        cp = pathlib.Path(rel)
-                        cd = cp.resolve() if cp.is_absolute() else (gd / cp).resolve()
-                        return cand, cd, True
-                    return cand, gd, True
-            except OSError:
-                return cand, None, True
-    return None, None, False
+    return _COMMON.find_git_root_and_common(start_path)
 
 
 def resolve_worktree_audit_path(log_template, payload, audit_mod, tool_cwd=None):
@@ -594,19 +628,11 @@ def resolve_worktree_audit_path(log_template, payload, audit_mod, tool_cwd=None)
     return audit_mod.expand(tpl, folder=folder_fallback)
 
 
-def cmd_hook_append(args):
-    """Handle Antigravity PostToolUse hook: append hash-chained entry and output '{}'."""
+def append_payload_entry(log_template, payload, step_info=None):
+    """Append one PostToolUse payload dict to log_template, reusing pre-fetched step_info when provided."""
     audit = load_sibling("audit_log")
-    raw = sys.stdin.read() if sys.stdin is not None else ""
-    try:
-        payload = json.loads(raw) if raw.strip() else {}
-    except ValueError:
-        print("{}")
-        return 0
     if not isinstance(payload, dict):
-        print("{}")
         return 0
-
     tc = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
     raw_name = tc.get("name") if isinstance(tc.get("name"), str) else "?"
     raw_args = parse_raw_args(tc)
@@ -623,9 +649,17 @@ def cmd_hook_append(args):
             inline_res = payload[rk] if isinstance(payload[rk], str) else json.dumps(payload[rk], ensure_ascii=False)
             break
 
-    found_step, step_status, body = find_step_in_transcript(tp, step_idx) if (tp and step_idx is not None) else (False, None, "")
+    if step_info is not None:
+        found_step, step_status, body, dur_ms = step_info
+    elif tp and step_idx is not None:
+        found_step, step_status, body, dur_ms = find_step_info_in_transcript(tp, step_idx)
+    else:
+        found_step, step_status, body, dur_ms = False, None, "", None
+
     if not found_step and inline_res is not None:
         found_step, body = True, inline_res
+        if dur_ms is None:
+            dur_ms = _extract_step_duration_ms(body)
 
     if err:
         kind = "failure"
@@ -647,13 +681,28 @@ def cmd_hook_append(args):
         "input": audit.summary(norm_input),
         "kind": kind,
         "result": res,
-        "duration_ms": None,
+        "duration_ms": dur_ms,
     }
+    tool_cwd = unwrap_arg_value(raw_args.get("Cwd") or raw_args.get("cwd") or raw_args.get("workspace")) if isinstance(raw_args, dict) else None
+    target = resolve_worktree_audit_path(log_template, payload, audit, tool_cwd=tool_cwd)
+    audit.append_entry(target, fields)
+    return 0
+
+
+def cmd_hook_append(args):
+    """Handle Antigravity PostToolUse hook: append hash-chained entry and output '{}'."""
+    raw = sys.stdin.read() if sys.stdin is not None else ""
     try:
-        tool_cwd = unwrap_arg_value(raw_args.get("Cwd") or raw_args.get("cwd") or raw_args.get("workspace")) if isinstance(raw_args, dict) else None
-        target = resolve_worktree_audit_path(args.log, payload, audit, tool_cwd=tool_cwd)
-        audit.append_entry(target, fields)
-    except (audit.AuditError, ValueError, OSError) as exc:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        print("{}")
+        return 0
+    if not isinstance(payload, dict):
+        print("{}")
+        return 0
+    try:
+        append_payload_entry(args.log, payload)
+    except (ValueError, OSError, Exception) as exc:
         print(f"agy_audit hook-append error: {exc}", file=sys.stderr)
         print("{}")
         return 1
@@ -840,7 +889,7 @@ def parse_day(text, end=False):
 def read_path_from_call(tool_raw, input_obj):
     """Extract read file path from read_file/view_file/shell read calls for --reads."""
     if (tool_raw or "").lower() in READ_TOOLS:
-        p = input_obj.get("Path") or input_obj.get("AbsolutePath") or input_obj.get("file_path") or input_obj.get("DirectoryPath")
+        p = input_obj.get("Path") or input_obj.get("AbsolutePath") or input_obj.get("file_path") or input_obj.get("DirectoryPath") or input_obj.get("path")
         return str(p) if p else None
     return None
 
@@ -875,7 +924,12 @@ def cmd_loops(args):
             for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
                 if not line.strip():
                     continue
-                entry = json.loads(line)
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
                 ts_dt = parse_iso(entry.get("ts"))
                 if since_dt and ts_dt and ts_dt < since_dt:
                     continue

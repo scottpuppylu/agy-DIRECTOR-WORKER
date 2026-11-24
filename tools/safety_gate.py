@@ -289,15 +289,16 @@ def check_tests(text, repo, problems, notes):
         notes.append("TESTS_LOCKED: NONE; no locked acceptance test (fine for docs-only work)")
         return
     for item in items:
-        m = re.fullmatch(r"(\S+)\s+sha256=([0-9a-fA-F]{64})", item)
+        m = re.fullmatch(r"(.+?)\s+sha256=([0-9a-fA-F]{64})", item)
         if not m:
             problems.append(f"TESTS_LOCKED: `{item}` is not `<path> sha256=<64 hex>`")
             continue
-        path = pathlib.Path(repo) / m.group(1)
+        rel = m.group(1).strip().strip("\"'`")
+        path = pathlib.Path(repo) / rel
         if not path.is_file():
-            problems.append(f"TESTS_LOCKED: {m.group(1)} not found under {pathlib.Path(repo).resolve()} (pass --repo)")
+            problems.append(f"TESTS_LOCKED: {rel} not found under {pathlib.Path(repo).resolve()} (pass --repo)")
         elif file_hash(path) != m.group(2).lower():
-            problems.append(f"TESTS_LOCKED: {m.group(1)} changed since it was locked; a worker may not edit the "
+            problems.append(f"TESTS_LOCKED: {rel} changed since it was locked; a worker may not edit the "
                             "acceptance tests (report BLOCKED instead)")
 
 

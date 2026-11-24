@@ -63,18 +63,19 @@ DEFAULTS = {"remote": "origin", "branch": "main", "title": "v{version} — agy-D
             "tag_message": "v{version}", "selftest": "python -I -X utf8 tools/selftest_agy.py", "gh_repo": None}
 VERSION_SHAPE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z]+)\.(\d+))?$")
 PRIVATE_PATHS = [(re.compile(r"(^|/)DIRECTOR/"), "a DIRECTOR/ file (project state, never public)"),
+                 (re.compile(r"(^|/)DIRECTOR-[^/]+/"), "a DIRECTOR-<repo>/ file (project state, never public)"),
                  (re.compile(r"(^|/)_work/"), "a _work/ file (scratch work, never public)"),
                  (re.compile(r"(^|/)AGENTS\.local\.md$"), "AGENTS.local.md (local instructions)"),
                  (re.compile(r"(^|/)\.dsh/|session\.v\d+\.jsonl|\.jsonl\.zstd$"), "an Antigravity or DSH session file"),
                  # 2.2.2-ds.3: upstream 2.2.2's Claude local files too (this repository is also edited from Claude Code)
-                 (re.compile(r"(^|/)\.agents/hooks\.local\.json$"), ".agents/hooks.local.json (local hooks)"),
+                 (re.compile(r"(^|/)\.agents/(?:hooks(?:\.local)?|plugins)\.json$"), ".agents/hooks.json or plugins.json (machine-bound paths)"),
                  (re.compile(r"(^|/)\.gemini/antigravity[^/]*/brain/|(^|/)transcript(?:_full)?\.jsonl$"), "an Antigravity transcript"),
                  (re.compile(r"(^|/)CLAUDE\.local\.md$"), "CLAUDE.local.md (local instructions)"),
                  (re.compile(r"(^|/)\.claude/settings\.local\.json$"), ".claude/settings.local.json (local settings)"),
                  (re.compile(r"(^|/)\.claude/projects/|(^|/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
                              r"\.jsonl$"), "a Claude session transcript")]
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
-USER_PATH = re.compile(r"(?i)\b[A-Z]:(?:[\\/]|\\\\)+Users(?:[\\/]|\\\\)+")
+USER_PATH = re.compile(r"(?i)(?:\b[A-Z]:(?:[\\/]|\\\\)+Users(?:[\\/]|\\\\)+|(?<![A-Za-z0-9_])/(?:Users|home)/[A-Za-z0-9._-]+/)")
 REAL_VALUE = re.compile(r"^[A-Za-z0-9/+_=.-]{12,}$")
 
 

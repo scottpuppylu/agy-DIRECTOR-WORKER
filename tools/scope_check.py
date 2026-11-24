@@ -404,10 +404,9 @@ def main():
         notes += limits_mod.legacy_notes(config)
         root = git(a.repo, "rev-parse", "--show-toplevel").strip()
         where = worktree_line(root)
-        merge_base = git(root, "merge-base", base, "HEAD").strip()
         names = ("diff", "--name-only", "--no-renames", "--ignore-submodules=none", "-z")
         commit = git(root, "rev-parse", "--verify", a.candidate + "^{commit}").strip() if a.candidate else None
-        since = git(root, "merge-base", base, commit).strip() if commit else merge_base
+        since = git(root, "merge-base", base, commit).strip() if commit else git(root, "merge-base", base, "HEAD").strip()
         others = set()
         if commit and not shared:
             cand_changed = {path for path in git(root, *names, since, commit).split("\0") if path}
@@ -418,6 +417,7 @@ def main():
             basis = f"candidate={commit[:12]}" if required is not None else None
             per_file = None
         else:
+            merge_base = since if not commit else git(root, "merge-base", base, "HEAD").strip()
             states = {"committed": git(root, *names, merge_base, "HEAD"), "staged": git(root, *names, "--cached", "HEAD"),
                       "unstaged": git(root, *names),
                       "untracked": git(root, "ls-files", "--others", "--exclude-standard", "-z")}

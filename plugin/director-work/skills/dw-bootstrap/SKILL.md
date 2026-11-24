@@ -22,11 +22,11 @@ description: >-
 3. **建置 `<DIRECTOR>/` 與專案 `.agents/` 設定**：
    - 先跑 dry-run 檢視：
      `python -B -I -X utf8 <RULES>/tools/agy_setup.py --repo <REPO> --rules <RULES> --init-director`
-   - 確認無誤後加 `--apply` 寫入（自動產生 `.agents/hooks.json`、`.agents/plugins.json`、Git common `info/exclude`、每專案獨立 `<DIRECTOR>` 骨架與預設受限 `.sessions.json`）；接著以 `--register-director <CONVERSATION_ID> --apply` 登記總監對話。
+   - 確認無誤後加 `--apply` 寫入（自動產生 `.agents/hooks.json`、`.agents/plugins.json`、Git common `info/exclude`、每專案獨立 `<DIRECTOR>` 骨架與預設受限 `.sessions.json`）；接著依執行輸出印出的 `<DIRECTOR>` 路徑填妥 `RESUME_STATE.md` 頂部四行，並以 `--register-director <CONVERSATION_ID> --apply` 登記總監對話。
 4. **量基準與環境自檢**：
    - 規則大小：`python -B -I -X utf8 <RULES>/tools/memory_size_check.py --kind rules --file <REPO>/AGENTS.md`（若無專案規則改查 `<RULES>/plugin/director-work/rules/AGENTS.md`）。
    - 環境與沙箱自檢：`python -B -I -X utf8 <RULES>/tools/agy_doctor.py --repo <REPO> --plugin <RULES>/plugin/director-work --probe-hooks`。
    - 用量基準：`python -B -I -X utf8 <RULES>/tools/agy_usage.py --project-dir <REPO> --out <DIRECTOR>/research/usage-baseline.json`（若無歷史對話記 `UNKNOWN`）。
-   - 建置驗證：`python -B -I -X utf8 <RULES>/tools/agy_setup_check.py <DIRECTOR> --repo <REPO> --strict`。
+   - 建置驗證：`python -B -I -X utf8 <RULES>/tools/agy_setup_check.py <DIRECTOR> --repo <REPO> --strict`（請先填好 `RESUME_STATE.md` 頂部四行再執行，否則 `--strict` 會擋下空白範本）。
 5. **第一份回報**：
    - 依 `BOOTSTRAP.md` 第 13 步以繁體中文提出六點精簡結論，並用 `ask_question` 讓 PO 拍板待決事項（如第一批 worker 編制、是否啟用 `--guard-mode ask`）。

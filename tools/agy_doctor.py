@@ -32,7 +32,7 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 
 REQUIRED_TOOLS = (
-    "agy_guard.py", "agy_audit.py", "agy_hook_bridge.py", "agy_usage.py",
+    "agy_common.py", "agy_guard.py", "agy_audit.py", "agy_hook_bridge.py", "agy_usage.py",
     "agy_doctor.py", "agy_setup.py", "agy_setup_check.py", "safety_gate.py",
     "gate_check.py", "scope_check.py", "evidence_record.py", "audit_log.py",
     "loop_guard.py", "inject_scan.py", "resume_inject.py", "report_vs_audit.py",
@@ -535,8 +535,14 @@ def main(argv=None):
     # 3. agy CLI (optional INFO if App-only)
     agy_bin = shutil.which("agy")
     if agy_bin:
-        ver_proc = subprocess.run([agy_bin, "--version"], capture_output=True, text=True, timeout=5)
-        items.append(check_item("agy_cli", "OK", f"{agy_bin} ({ver_proc.stdout.strip() or 'version ok'})"))
+        try:
+            ver_proc = subprocess.run([agy_bin, "--version"], capture_output=True, text=True, timeout=5)
+            if ver_proc.returncode == 0:
+                items.append(check_item("agy_cli", "OK", f"{agy_bin} ({ver_proc.stdout.strip() or 'version ok'})"))
+            else:
+                items.append(check_item("agy_cli", "WARN", f"{agy_bin} exited {ver_proc.returncode}: {(ver_proc.stderr or ver_proc.stdout).strip()[:120]}"))
+        except (OSError, subprocess.SubprocessError) as exc:
+            items.append(check_item("agy_cli", "WARN", f"{agy_bin} version check failed: {exc}"))
     else:
         items.append(check_item("agy_cli", "INFO", "agy CLI not on PATH (normal when running inside Antigravity App 2.0)"))
 
@@ -550,9 +556,13 @@ def main(argv=None):
                      key=lambda p: p.stat().st_mtime, reverse=True)
         if tfs:
             try:
-                first_obj = json.loads(tfs[0].read_text(encoding="utf-8", errors="replace").splitlines()[0])
+                with open(tfs[0], "r", encoding="utf-8", errors="replace") as fh:
+                    first_line = fh.readline().strip()
+                if not first_line:
+                    raise ValueError("empty first line")
+                first_obj = json.loads(first_line)
                 items.append(check_item("transcripts", "OK", f"{len(tfs)} conversation(s); latest step_index={first_obj.get('step_index')}"))
-            except (OSError, IndexError, ValueError) as exc:
+            except (OSError, ValueError) as exc:
                 items.append(check_item("transcripts", "WARN", f"found {tfs[0].name} but failed parse: {exc}"))
         else:
             items.append(check_item("transcripts", "INFO", f"brain root exists ({existing_roots[0].as_posix()}) with 0 transcripts yet"))
