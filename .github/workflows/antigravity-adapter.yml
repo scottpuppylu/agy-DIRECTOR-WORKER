@@ -1,0 +1,64 @@
+name: Antigravity Adapter & Base Checks
+
+on:
+  push:
+    branches: [main, v3-agy]
+  pull_request:
+
+jobs:
+  adapter-matrix:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run Antigravity adapter self-test
+        run: python -B -I -X utf8 adapters/antigravity/selftest_antigravity.py
+      - name: Check monotonic variant version
+        run: python -B -I -X utf8 adapters/antigravity/agy_version.py
+      - name: Check memory budget chain (<= 24,576 B incl. .agent/rules)
+        run: |
+          python -B -I -X utf8 tools/memory_size_check.py --chain README.md BOOTSTRAP.md docs/01_roles_authority.md docs/03_communication.md docs/06_resume_lossless.md docs/08_safety_rules.md --rules-file adapters/antigravity/rules/director-work.md
+          python -B -I -X utf8 tools/memory_size_check.py --chain README.md BOOTSTRAP.md docs/01_roles_authority.md docs/03_communication.md docs/06_resume_lossless.md docs/08_safety_rules.md docs/12a_before_brief.md --rules-file adapters/antigravity/rules/director-work.md
+      - name: Check variant README sections (HEAD)
+        run: python -B -I -X utf8 tools/readme_check.py --repo . --rev HEAD --kind variant
+      - name: Check privacy scan (HEAD)
+        run: python -B -I -X utf8 tools/privacy_scan.py --rev HEAD
+      - name: Probe doctor & plugin hooks
+        run: python -B -I -X utf8 adapters/antigravity/agy_doctor.py --probe-hooks
+      - name: Run base self-test suite
+        run: python -B -I -X utf8 tools/selftest.py
+
+  python3-only-linux:
+    name: ubuntu-24.04 python3-only fallback
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify plugin seatbelt without `python` symlink on PATH
+        run: |
+          PY3_BIN="$(command -v python3)"
+          ISOLATED_BIN="$(mktemp -d)"
+          ln -s "$PY3_BIN" "$ISOLATED_BIN/python3"
+          for tool in sh env cat git awk sed tr dirname basename head tail; do
+            T="$(command -v "$tool" || true)"
+            if [ -n "$T" ]; then ln -sf "$T" "$ISOLATED_BIN/$tool"; fi
+          done
+          export PATH="$ISOLATED_BIN"
+          if command -v python >/dev/null 2>&1; then
+            echo "ERROR: python should not exist on isolated PATH"
+            exit 1
+          fi
+          python3 -B -I -X utf8 adapters/antigravity/agy_doctor.py --probe-hooks
+          python3 -B -I -X utf8 adapters/antigravity/selftest_antigravity.py

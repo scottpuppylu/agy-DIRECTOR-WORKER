@@ -1,0 +1,35 @@
+{
+  "schema": "dw-base-sync/1",
+  "adapter": "adapters/antigravity/",
+  "overrides": {
+    "README.md": {
+      "why": "Antigravity variant landing page (templates/VARIANT_README.md, B7, B19: series table, 新增/沿用上游/拿掉/跨變體借用, concise install pointer so CRLF beginner chain + .agent/rules DW section <= 24,576 B)",
+      "base_sha256": "33ec0cce4dcab786711dfe438a3ee180a33d5e5144cbf6bb14c5f9034f3e5755"
+    },
+    "CHANGELOG.md": {
+      "why": "3.0.0-agy.7 release history, upstream 0e9ae22 handling table, NOT_PORTED items, blind handoff score, P1-1..P1-3 review fixes, and preserved 2.6.0-agy.1..6 history; base history kept byte-for-byte in CHANGELOG-upstream.md",
+      "base_sha256": "75f71e10d130fbd1bd69a12c2b7996d411f9bdacf7e6c4ace16853850b7bfcbe"
+    },
+    "VERSION": {
+      "why": "Antigravity variant version identifier continuing monotonic -agy.N serial (3.0.0-agy.7)",
+      "base_sha256": "2985be8b28d3ade858e8d8fb4bc22f565b1bf6020dff982dce141f7721b9999c"
+    },
+    "tools/selftest.py": {
+      "why": "Only adapts the 2 Claude-Desktop-only README needles in test_onboarding_v210 and PO_PAGE_WANTED to Antigravity's ask_question + PO_PENDING.md wording (no docs/11, same pattern as dshdw); upstream_300(), B15 VARIANT.json default_strength, B19 rules_section, and F13 literal split are all synced with frozen base 0e9ae22",
+      "base_sha256": "775bdb5fb602ce596e27539adc9c014634b6fe65b18f6f684206ecb82bb502d0"
+    }
+  },
+  "not_ported": {},
+  "variant_files": {
+    "BASE_VERSION": "Frozen base release version checked by tools/base_sync_check.py",
+    "CHANGELOG-upstream.md": "Verbatim byte copy of base CHANGELOG.md (0e9ae22) inspected by base tools/selftest.py",
+    ".github/workflows/antigravity-adapter.yml": "CI workflow testing adapters/antigravity, B19 rules-included 24 KB chain, readme_check, privacy_scan, and python3-only PATH"
+  },
+  "variant_rules": {
+    "director_in_project": "R3/agydw: per-project governance folder lives inside repo at <REPO>/DIRECTOR/ (git-ignored via info/exclude + DIRECTOR/.gitignore)",
+    "workspace_rules_file": "Antigravity workspace rules file written to <REPO>/.agent/rules/director-work.md (DW section measured in 24 KB chain via VARIANT.json rules_section; plugin AGENTS.md stays <= 4 KB)",
+    "spec_gate_hook": "R6: adapters/antigravity/spec_gate_hook.py checks BRIEF.md live (no cache) before product writes/branches/subagents across general and beginner modes",
+    "unified_post_tool": "G3: agy_hook_bridge.py post-tool runs audit + poll_hint + inject_scan in one process; single-pass agy_usage.py reuses tools/_common.py D7",
+    "monotonic_agy_version": "VERSION retains -agy.N serial numbering across base bumps (2.6.0-agy.6 -> 3.0.0-agy.7) verified by agy_version.py"
+  }
+}

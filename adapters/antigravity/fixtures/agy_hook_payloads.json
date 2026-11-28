@@ -1,0 +1,130 @@
+{
+  "antigravity": {
+    "clean_cmd": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "run_command",
+        "args": {"CommandLine": "git status"}
+      }
+    },
+    "clean_read": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "read_file",
+        "args": {"Path": "/workspace/demo/repo/src/app.py"}
+      }
+    },
+    "g00_edit_guard": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "edit_file",
+        "args": {"Path": "/workspace/demo/repo/DIRECTOR/adapters/antigravity/agy_guard.py"}
+      }
+    },
+    "g01_force_push": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "run_command",
+        "args": {"CommandLine": "git push --force origin main"}
+      }
+    },
+    "g02_reset_hard": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "run_command",
+        "args": {"CommandLine": "git reset --hard HEAD~1"}
+      }
+    },
+    "g43_hooks_edit": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "write_file",
+        "args": {"Path": "/workspace/demo/repo/.agents/hooks.json"}
+      }
+    },
+    "g43_rules_edit": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "write_file",
+        "args": {"Path": "/workspace/demo/repo/.agent/rules/director-work.md"}
+      }
+    },
+    "g50_secret_read_app2": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "read_file",
+        "args": {"Path": "/workspace/demo/repo/.env.production"}
+      }
+    },
+    "g50_secret_read_ide": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "view_file",
+        "args": {"AbsolutePath": "/workspace/secrets/id_ed25519"}
+      }
+    },
+    "g53_oauth_read": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "read_file",
+        "args": {"Path": "/workspace/demo/.gemini/oauth_creds.json"}
+      }
+    },
+    "protected_order_write_app2": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "write_file",
+        "args": {"Path": "/workspace/demo/repo/DIRECTOR/orders/WO-001.md"}
+      }
+    },
+    "protected_log_edit_ide": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "replace_file_content",
+        "args": {"TargetFile": "/workspace/demo/repo/DIRECTOR/DIRECTOR_LOG.md"}
+      }
+    },
+    "bare_python_cmd": {
+      "hookEventName": "PreToolUse",
+      "conversationId": "conv-demo-001",
+      "toolCall": {
+        "name": "run_command",
+        "args": {"CommandLine": "python tools/check.py --flag 1"}
+      }
+    },
+    "stop_continuation_active": {
+      "hookEventName": "Stop",
+      "conversationId": "conv-demo-001",
+      "continuationActive": true,
+      "terminationReason": "NO_TOOL_CALL"
+    },
+    "stop_no_tool_call": {
+      "hookEventName": "Stop",
+      "conversationId": "conv-demo-001",
+      "continuationActive": false,
+      "terminationReason": "NO_TOOL_CALL"
+    }
+  },
+  "claude": {
+    "g02_reset_hard": {
+      "tool_name": "Bash",
+      "tool_input": {"command": "git reset --hard"}
+    },
+    "clean_read": {
+      "tool_name": "Read",
+      "tool_input": {"file_path": "/workspace/demo/repo/README.md"}
+    }
+  }
+}

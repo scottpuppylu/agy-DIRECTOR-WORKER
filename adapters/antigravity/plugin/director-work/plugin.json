@@ -1,0 +1,21 @@
+{
+  "name": "director-work",
+  "displayName": "DIRECTOR-WORK (agydw)",
+  "version": "3.0.0-agy.7",
+  "description": "Antigravity governance adapter for DIRECTOR-WORK 3.0.0: strict BRIEF spec_gate, in-project DIRECTOR/, .agent/rules/, blind review, hash-chained audit, and cross-variant lossless handoff.",
+  "author": "DIRECTOR-WORK",
+  "license": "MIT",
+  "skills": "skills",
+  "keywords": [
+    "director-work",
+    "governance",
+    "spec-gate",
+    "audit",
+    "antigravity"
+  ],
+  "suggestedPrompts": [
+    "幫這個專案初始化 agydw 總監與規則（寫入 DIRECTOR/ 與 .agent/rules/）",
+    "檢查目前 DIRECTOR/BRIEF.md 與工單門檻是否全部通過",
+    "用 ask_question + PO_PENDING.md 釐清需求後鎖定規格"
+  ]
+}

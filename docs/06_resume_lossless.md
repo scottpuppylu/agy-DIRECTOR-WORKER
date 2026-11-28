@@ -1,27 +1,25 @@
 # 06 無損續航
 
-目標：壓縮、額度耗盡、錯誤、當機或重開之後，每條工作線都能從最後已驗證的 checkpoint 接著做，不重做、不沿用半成品。
+目標：額度用完、錯誤、當機、重開機、PO 手動停止之後，每條工作線都從最後一個已驗證的 checkpoint 接著做，不重做已完成的事，也不沿用半成品。
 
 ## 規則
 
-### `RESUME_STATE.md`
+### RESUME_STATE.md
 
-- 每條工作線維護一份 `RESUME_STATE.md`（`templates/RESUME_STATE.md`），路徑登記在 `DIRECTOR/ACTIVE_WORKSTREAMS.md`。
-- **頂部固定四行** `PROGRESS:` / `DOING:` / `NEXT_STEP:` / `COMMS:`，只看四行就能接手；其餘欄位缺則寫 `NONE`。`IN_FLIGHT` 記背景任務 ID、輸出與完成判定。
-- **何時更新**：每次 checkpoint commit 後、送 TEST REQUEST 前、背景／子代理啟動與結束時、收到總監裁決後、對話長到接近壓縮前。寫完再做下一步。
-- `UPDATED` 讀系統時鐘；寫完跑 `gate_check.py --resume <檔>` 查格式與大小（預設 20 KiB／單行 4 KiB，超過用 `resume_archive.py` 歸檔舊段，不動近期與未結段）。
-- 有成果就 commit；進度絕不只留在對話記憶。
+- 每條工作線在自己的工作資料夾根目錄維護一份（`templates/RESUME_STATE.md`），路徑登記在 `ACTIVE_WORKSTREAMS.md`。
+- **頂部固定四行** `PROGRESS / DOING / NEXT_STEP / COMMS`，只看這四行就要能接手。其餘欄位照範本逐欄寫齊，沒有就寫 NONE；IN_FLIGHT 列背景程序、計時器和等待程序。
+- **何時更新**：每個 checkpoint commit 之後、送 TEST REQUEST 之前、背景程序啟動和結束時、收到總監決定時、壓縮之前。寫完才做下一步。`UPDATED` 讀系統時鐘（`date`）。
+- 寫完用 `tools/gate_check.py --resume <檔案>` 檢查格式和大小（超過照 `docs/06b` 瘦身）。
+- 有成果就 commit，進度不只留在對話裡。
 
-### 恢復與每輪第一步
+### 恢復
 
-- 啟用 `agy_hook_bridge.py` 時，`SessionStart` 會注入四行表頭與未結段，`PreInvocation` 會在偵測到 `CHECKPOINT` 壓縮後自動重注；未啟用 hook 時，恢復後手動跑一次 `resume_inject.py --file <RESUME_STATE.md>`（與有設則跑 `status.py`）。
-- 任何輪次被中斷的擷取／量測／打包一律重跑，不沿用半成品。
-- 若在 Swarm 中遇模型額度耗盡，優先以 `swarm{action:"model"}` 熱切換模型接續對話，勿直接 `kill`。
+任何 session 被打斷或換總監（`INDEX.md`、`handoff.py`）後，第一件事照 `docs/06b` 的恢復程序做。中斷的擷取、量測、打包、匯入一律重做，不沿用。每個排程和防護機制都要能重建（`DIRECTOR/GUARDS.md`）；建立、修改機制或設重置喚醒時讀 `docs/06b`。
 
-### 機制與重建
+### 每輪第一步
 
-所有防護與排程（`.agents/hooks.json`、`schedule` 定時任務、`pause_ctl`）必登記於 `DIRECTOR/GUARDS.md` 附檢查與重建指令；重建步驟見 `docs/06b`。
+總監每次喚醒、壓縮或恢復後只有一個第一步：先唯讀跑檢查腳本、收集輸入（含待決頁、選擇頁），再處理待決頁。見 `docs/06b`。
 
 ## 為什麼
 
-- 其他理由見 `docs/10`。
+- 其他理由見 docs/10。

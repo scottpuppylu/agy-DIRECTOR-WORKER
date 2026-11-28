@@ -1,0 +1,65 @@
+{
+  "agydw-spec-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -B -I -X utf8 DIRECTOR/adapters/antigravity/spec_gate_hook.py --brief DIRECTOR/BRIEF.md --director DIRECTOR --tools DIRECTOR/tools",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  },
+  "agydw-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|read_file|view_file|view_file_outline|view_code_item|list_dir|grep_search|find_by_name|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|send_message|post_message|call_mcp_tool|mcp_.*|run_workflow|manage_task|invoke_subagent|swarm",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -B -I -X utf8 DIRECTOR/adapters/antigravity/agy_guard.py --rules DIRECTOR/tools/guard_rules.json --profile worker --mode remind --protect DIRECTOR --pause-flag DIRECTOR/PAUSE.flag --sessions DIRECTOR/.sessions.json --audit DIRECTOR/audit/{worktree}.jsonl --bridge-state DIRECTOR/.bridge_state",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  },
+  "agydw-audit-and-bridge": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python -B -I -X utf8 DIRECTOR/adapters/antigravity/agy_hook_bridge.py session-start --resume DIRECTOR/RESUME_STATE.md --state-dir DIRECTOR/.bridge_state --banner",
+        "timeout": 10
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -B -I -X utf8 DIRECTOR/adapters/antigravity/agy_hook_bridge.py post-tool --audit-log DIRECTOR/audit/{worktree}.jsonl --state-dir DIRECTOR/.bridge_state --inject-scan",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python -B -I -X utf8 DIRECTOR/adapters/antigravity/agy_hook_bridge.py pre-invocation --state-dir DIRECTOR/.bridge_state --resume DIRECTOR/RESUME_STATE.md",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python -B -I -X utf8 DIRECTOR/adapters/antigravity/agy_hook_bridge.py stop-check --resume DIRECTOR/RESUME_STATE.md --repo . --sessions DIRECTOR/.sessions.json --state-dir DIRECTOR/.bridge_state",
+        "timeout": 10
+      }
+    ]
+  }
+}

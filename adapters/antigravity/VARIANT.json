@@ -1,0 +1,5 @@
+{
+  "default_strength": "standard",
+  "rules_section": "adapters/antigravity/rules/director-work.md",
+  "_why": "SPEC_VARIANTS_300 agy: standard safety strength with R6 PreToolUse hook (base B15); the DW section Antigravity loads from .agent/rules/director-work.md on every turn counts in the 24 KB must-read chain (base B19)"
+}
